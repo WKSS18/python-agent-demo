@@ -168,6 +168,16 @@ async def upload_file(
     return success(uploaded)
 
 
+@app.delete("/uploads", response_model=schemas.ApiResponse[None])
+def delete_uploaded_file(
+    data: schemas.UploadedFileDelete,
+    current_user: models.User = Depends(get_current_user),
+) -> schemas.ApiResponse[None]:
+    """移除附件时清理尚未发送的 OSS 对象。"""
+    OssStorage().delete(owner_id=current_user.id, object_key=data.object_key)
+    return success(message="附件已删除")
+
+
 @app.post("/agent/forms/note", response_model=schemas.ApiResponse[schemas.NoteRead])
 def submit_agent_note_form(
     data: schemas.AgentNoteFormSubmit,

@@ -1,0 +1,12 @@
+# 本机密钥和环境配置不得提交。
+.env
+.env.*
+!.env.example
+
+# Python 本地运行产物。
+.venv/
+__pycache__/
+*.py[cod]
+
+# macOS 元数据。
+.DS_Store

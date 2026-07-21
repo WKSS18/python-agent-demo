@@ -77,6 +77,10 @@ class UploadedFile(BaseModel):
     url: str
 
 
+class UploadedFileDelete(BaseModel):
+    object_key: str = Field(min_length=1)
+
+
 class AgentMessageRead(BaseModel):
     id: int
     session_id: int

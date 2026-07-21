@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import agent, chat_forms, crud, models, schemas
+from app.config import get_settings
 from app.database import SessionLocal
 from app.file_parser import ParsedFile
 from app.security import hash_password, verify_password
@@ -279,10 +280,8 @@ class AgentService(BaseService):
                 },
             )
         question = prompt.strip() or "请总结并分析这份文件"
-        request = schemas.AgentChatRequest(
-            question=f"上传文件：{parsed_file.name}\n分析要求：{question}",
-            session_id=session_id,
-        )
+        # 文件名和预览信息已在 attachment 中持久化，正文仅保存用户语句。
+        request = schemas.AgentChatRequest(question=question, session_id=session_id)
         try:
             next_session_id = service._save_user_message(
                 owner_id,
@@ -292,12 +291,37 @@ class AgentService(BaseService):
             yield _sse_event("session", {"session_id": next_session_id})
             yield _sse_event("attachment", {"attachment": attachment})
 
+            # 消息已先持久化；即使当前模型无法分析图片，刷新后仍能恢复附件历史。
+            if (
+                parsed_file.image_content
+                and not get_settings().anthropic_vision_enabled
+                and not parsed_file.text
+            ):
+                fallback_answer = (
+                    "图片已保存，但当前 DeepSeek 模型不支持图片输入，"
+                    "且 OCR 未识别到可分析的文字。请配置支持视觉的模型后重试。"
+                )
+                message = crud.add_agent_message(
+                    db,
+                    session_id=next_session_id,
+                    role="assistant",
+                    content=fallback_answer,
+                    message_data={"used_notes": [], "attachment": attachment},
+                )
+                service._commit()
+                db.refresh(message)
+                yield _sse_event("delta", {"content": fallback_answer})
+                yield _sse_event("done", {"message_id": message.id})
+                return
+
             answer_parts: list[str] = []
             for text_delta in agent.stream_file_analysis(
                 parsed_file.name,
                 parsed_file.text,
                 question,
                 parsed_file.extraction_method,
+                parsed_file.image_content,
+                parsed_file.image_media_type,
             ):
                 answer_parts.append(text_delta)
                 yield _sse_event("delta", {"content": text_delta})
@@ -353,8 +377,8 @@ class AgentService(BaseService):
 
     def _retrieve_note_snapshots(self, owner_id: int, question: str) -> list[schemas.NoteRead]:
         keyword_notes = crud.list_notes(self.db, owner_id=owner_id, keyword=question)
-        fallback_notes = crud.list_notes(self.db, owner_id=owner_id)[:3]
-        selected_notes = keyword_notes[:5] if keyword_notes else fallback_notes
+        # 没有真实命中时不得用“最近笔记”冒充引用，交给模型自身知识回答。
+        selected_notes = keyword_notes[:5]
 
         # 转成 DTO 后结束读事务，避免慢速模型调用长期占用数据库连接和事务。
         snapshots = [schemas.NoteRead.model_validate(note) for note in selected_notes]

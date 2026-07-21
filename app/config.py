@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     anthropic_auth_token: str = ""
     anthropic_base_url: str = "https://api.anthropic.com"
     anthropic_model: str = "claude-sonnet-4-5"
+    # 可单独指定视觉模型；留空时复用 anthropic_model。
+    anthropic_vision_model: str = ""
+    anthropic_vision_enabled: bool = True
     anthropic_default_opus_model: str = ""
     anthropic_default_sonnet_model: str = ""
     anthropic_default_haiku_model: str = ""

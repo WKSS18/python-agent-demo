@@ -86,6 +86,8 @@ DATABASE_URL=mysql+pymysql://app_user:你的密码@127.0.0.1:3306/ai_agent_demo?
 ANTHROPIC_AUTH_TOKEN=你的模型密钥
 ANTHROPIC_BASE_URL=https://api.anthropic.com
 ANTHROPIC_MODEL=你的模型名
+ANTHROPIC_VISION_MODEL=支持图片输入的模型名
+ANTHROPIC_VISION_ENABLED=true
 API_TIMEOUT_MS=600000
 OSS_ACCESS_KEY_ID=你的 AccessKey ID
 OSS_ACCESS_KEY_SECRET=你的 AccessKey Secret
@@ -158,9 +160,9 @@ alembic downgrade -1
 - 文本文件：后端按 UTF-8 或 GB18030 解码。
 - PDF：使用 PyPDF 提取文本；加密文件和纯扫描件会给出明确错误。
 - DOCX：提取正文段落和表格单元格。
-- 图片：Tesseract 先做中英文 OCR，再把识别文本交给模型。
+- 图片：Pillow 纠正方向、限制长边并压缩，再以 Anthropic `image` 内容块交给视觉模型；Tesseract 中英文 OCR 作为补充上下文。
 
-当前 DeepSeek Anthropic 兼容接口只支持文本消息，不支持直接发送 Anthropic `image/document` 内容块。因此本项目采用“文件解析/OCR -> 文本模型分析”的兼容方案。它适合截图文字、报告和合同内容总结，但不等于真正的视觉理解：图表趋势、照片物体和复杂版式可能分析不准。若以后换成支持视觉的模型，可以在 `file_parser.py` 之外新增视觉 Provider，而不必改路由、Service 和前端 SSE 协议。
+图片分析需要模型服务支持 Anthropic `image` 内容块。`ANTHROPIC_VISION_MODEL` 留空时复用 `ANTHROPIC_MODEL`；如果使用 DeepSeek 等不支持图片内容块的兼容服务，需设置 `ANTHROPIC_VISION_ENABLED=false`，此时图片只能根据 OCR 文本分析。未配置任何模型密钥时仍返回本地 mock，便于验证上传、SSE 和消息持久化链路。
 
 附件元数据和 OSS 对象键保存在 `agent_messages.message_data`，原始文件保存在 OSS，不进入 MySQL。当前对象路径包含用户 ID、日期和随机 UUID，便于做账号隔离、生命周期清理和审计。
 

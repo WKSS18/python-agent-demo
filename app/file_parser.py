@@ -6,13 +6,14 @@ from zipfile import BadZipFile, ZipFile
 
 import pytesseract
 from fastapi import HTTPException, status
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pypdf import PdfReader
 
 
 MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_EXTRACTED_CHARS = 60_000
 MAX_IMAGE_PIXELS = 25_000_000
+MAX_VISION_LONG_EDGE = 1_568
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".csv", ".pdf", ".docx", ".png", ".jpg", ".jpeg", ".webp"}
 
 
@@ -26,6 +27,8 @@ class ParsedFile:
     text: str
     extraction_method: str
     truncated: bool
+    image_content: bytes | None = None
+    image_media_type: str | None = None
 
     def attachment_data(self) -> dict:
         return {
@@ -72,6 +75,8 @@ def parse_uploaded_file(filename: str | None, media_type: str | None, content: b
     upload = validate_upload(filename, media_type, content)
     safe_name = upload.name
     suffix = upload.suffix
+    image_content: bytes | None = None
+    image_media_type: str | None = None
 
     try:
         if suffix in {".txt", ".md", ".csv"}:
@@ -81,7 +86,9 @@ def parse_uploaded_file(filename: str | None, media_type: str | None, content: b
         elif suffix == ".docx":
             text, method = _extract_docx(content), "Word 文本提取"
         else:
-            text, method = _extract_image_ocr(content), "图片 OCR"
+            # 视觉模型负责画面理解，OCR 仅作为文字识别的补充上下文。
+            image_content, image_media_type = _prepare_image_for_model(content, suffix)
+            text, method = _extract_image_ocr(content), "视觉模型 + 图片 OCR"
     except HTTPException:
         raise
     except Exception as exc:
@@ -91,9 +98,11 @@ def parse_uploaded_file(filename: str | None, media_type: str | None, content: b
         ) from exc
 
     normalized = "\n".join(line.rstrip() for line in text.splitlines()).strip()
-    if not normalized:
-        detail = "没有识别到文字，请上传文字更清晰的图片。" if method == "图片 OCR" else "文件中没有提取到可分析的文字。"
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail)
+    if not normalized and image_content is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="文件中没有提取到可分析的文字。",
+        )
 
     truncated = len(normalized) > MAX_EXTRACTED_CHARS
     if truncated:
@@ -105,6 +114,8 @@ def parse_uploaded_file(filename: str | None, media_type: str | None, content: b
         text=normalized,
         extraction_method=method,
         truncated=truncated,
+        image_content=image_content,
+        image_media_type=image_media_type,
     )
 
 
@@ -150,5 +161,25 @@ def _extract_image_ocr(content: bytes) -> str:
             languages = pytesseract.get_languages(config="")
             language = "chi_sim+eng" if "chi_sim" in languages else "eng"
             return pytesseract.image_to_string(image.convert("RGB"), lang=language)
+    except (UnidentifiedImageError, Image.DecompressionBombError) as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="图片格式无效或文件已损坏。") from exc
+
+
+def _prepare_image_for_model(content: bytes, suffix: str) -> tuple[bytes, str]:
+    """纠正图片方向并限制分辨率，减少视觉 token 和请求体积。"""
+    try:
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+        with Image.open(BytesIO(content)) as source:
+            image = ImageOps.exif_transpose(source)
+            image.thumbnail((MAX_VISION_LONG_EDGE, MAX_VISION_LONG_EDGE), Image.Resampling.LANCZOS)
+
+            output = BytesIO()
+            if suffix == ".png" and image.mode in {"RGBA", "LA"}:
+                image.save(output, format="PNG", optimize=True)
+                return output.getvalue(), "image/png"
+
+            # JPEG 对照片体积更友好；统一转 RGB 避免透明度和色彩模式不兼容。
+            image.convert("RGB").save(output, format="JPEG", quality=88, optimize=True)
+            return output.getvalue(), "image/jpeg"
     except (UnidentifiedImageError, Image.DecompressionBombError) as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="图片格式无效或文件已损坏。") from exc

@@ -63,6 +63,14 @@ class OssStorage:
         except (oss2.exceptions.OssError, oss2.exceptions.RequestError) as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="生成文件预览地址失败。") from exc
 
+    def delete(self, owner_id: int, object_key: str) -> None:
+        """删除用户已上传但尚未发送的对象，避免 OSS 残留垃圾文件。"""
+        self.ensure_owned(owner_id, object_key)
+        try:
+            self._bucket().delete_object(object_key)
+        except (oss2.exceptions.OssError, oss2.exceptions.RequestError) as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="删除 OSS 文件失败。") from exc
+
     def refresh_attachment_url(self, owner_id: int, attachment: dict | None) -> dict | None:
         if not isinstance(attachment, dict):
             return None
