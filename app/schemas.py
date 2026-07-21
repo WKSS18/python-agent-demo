@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
 
 
 T = TypeVar("T")
@@ -93,3 +93,9 @@ class AgentMessageRead(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, value: datetime) -> str:
+        """SQLite 的 CURRENT_TIMESTAMP 是 UTC，但读取后不携带时区信息。"""
+        utc_value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return utc_value.isoformat().replace("+00:00", "Z")
