@@ -1,3 +1,10 @@
+"""FastAPI 应用入口与 HTTP 路由。
+
+本层负责协议适配：接收参数、注入 Session/当前用户、声明响应模型以及构造 SSE。
+具体业务交给 Service，文件解析交给 file_parser，对象存储交给 storage，保持路由
+函数短小且容易从 Swagger 理解。
+"""
+
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.responses import StreamingResponse
@@ -18,6 +25,8 @@ settings = get_settings()
 app = FastAPI(title=settings.app_name)
 register_exception_handlers(app)
 
+
+# ------------------------------ 基础与认证 ------------------------------
 
 @app.get("/health", response_model=schemas.ApiResponse[dict[str, str]])
 def health_check() -> schemas.ApiResponse[dict[str, str]]:
@@ -52,6 +61,9 @@ def get_me(
     current_user: models.User = Depends(get_current_user),
 ) -> schemas.ApiResponse[schemas.UserRead]:
     return success(current_user)
+
+
+# ------------------------------ 知识笔记 ------------------------------
 
 
 @app.post("/notes", response_model=schemas.ApiResponse[schemas.NoteRead])
@@ -99,6 +111,9 @@ def delete_note(
 ) -> schemas.ApiResponse[None]:
     NoteService(db).delete(owner_id=current_user.id, note_id=note_id)
     return success(message="删除成功")
+
+
+# ------------------------------ Agent 与 SSE ------------------------------
 
 
 @app.post("/agent/chat", response_model=schemas.ApiResponse[schemas.AgentChatResponse])
@@ -151,6 +166,9 @@ async def analyze_uploaded_file(
     )
 
 
+# ------------------------------ OSS 附件 ------------------------------
+
+
 @app.post("/uploads", response_model=schemas.ApiResponse[schemas.UploadedFile])
 async def upload_file(
     file: UploadFile = File(...),
@@ -176,6 +194,9 @@ def delete_uploaded_file(
     """移除附件时清理尚未发送的 OSS 对象。"""
     OssStorage().delete(owner_id=current_user.id, object_key=data.object_key)
     return success(message="附件已删除")
+
+
+# ------------------------------ 结构化表单与历史 ------------------------------
 
 
 @app.post("/agent/forms/note", response_model=schemas.ApiResponse[schemas.NoteRead])

@@ -1,3 +1,9 @@
+"""纯数据访问层。
+
+本模块只组织 SQLAlchemy 查询和对象增删，不调用 ``commit``/``rollback``。
+事务边界由 Service 按完整业务动作统一控制，这样多个写操作可以保证原子性。
+"""
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -21,6 +27,7 @@ def add_note(db: Session, owner_id: int, title: str, content: str) -> models.Not
 
 
 def list_notes(db: Session, owner_id: int, keyword: str | None = None) -> list[models.Note]:
+    """按用户查询笔记；关键字同时匹配标题和正文。"""
     query = select(models.Note).where(models.Note.owner_id == owner_id).order_by(models.Note.id.desc())
     if keyword:
         like_keyword = f"%{keyword}%"
@@ -61,6 +68,7 @@ def get_owned_agent_message_for_update(
 
 
 def add_agent_session(db: Session, owner_id: int, title: str) -> models.AgentSession:
+    """创建会话并 flush 获取主键，但把是否提交留给调用方决定。"""
     session = models.AgentSession(owner_id=owner_id, title=title[:200] or "New chat")
     db.add(session)
     # flush 只把 SQL 发给数据库而不提交，用于在同一事务内取得自增 ID。
@@ -88,6 +96,7 @@ def add_agent_message(
 
 
 def list_agent_messages(db: Session, session_id: int) -> list[models.AgentMessage]:
+    """按主键升序恢复聊天顺序；会话归属必须由调用前的 Service 校验。"""
     query = (
         select(models.AgentMessage)
         .where(models.AgentMessage.session_id == session_id)

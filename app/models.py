@@ -1,3 +1,9 @@
+"""数据库 ORM 模型。
+
+Model 描述“如何持久化”，不承担接口校验和业务权限判断；API 输入输出由 schemas
+负责，用户归属校验由 Service 负责，从而避免把数据库对象直接暴露给客户端。
+"""
+
 from datetime import datetime
 
 from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, func
@@ -7,6 +13,7 @@ from app.database import Base
 
 
 class User(Base):
+    """账户表：仅保存密码哈希，不保存明文密码。"""
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
@@ -19,6 +26,7 @@ class User(Base):
 
 
 class Note(Base):
+    """知识笔记表；``owner_id`` 是多用户数据隔离的归属字段。"""
     __tablename__ = "notes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
@@ -32,6 +40,7 @@ class Note(Base):
 
 
 class AgentSession(Base):
+    """一次连续聊天会话；标题取首条用户问题，便于后续扩展会话列表。"""
     __tablename__ = "agent_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
@@ -44,6 +53,11 @@ class AgentSession(Base):
 
 
 class AgentMessage(Base):
+    """会话消息表。
+
+    ``content`` 保存可展示正文，``message_type`` 决定前端渲染器，``message_data``
+    保存引用快照、附件信息或结构化表单，避免为每种消息扩一张表。
+    """
     __tablename__ = "agent_messages"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)

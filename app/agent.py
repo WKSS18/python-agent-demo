@@ -1,3 +1,10 @@
+"""Agent 编排与模型适配层。
+
+本模块只处理“检索上下文 -> 组织提示词 -> 调用模型”，不依赖 HTTP 和数据库事务。
+同步接口通过 LangGraph 表达工作流，流式接口直接迭代模型增量，均可被 Service 或
+测试复用。模型调用统一走 Anthropic Messages 兼容协议。
+"""
+
 import base64
 from collections.abc import Callable
 from typing import Any, TypedDict
@@ -17,6 +24,7 @@ SYSTEM_PROMPT = (
 
 
 class AgentState(TypedDict):
+    """LangGraph 节点之间共享的显式状态，便于检查每一步输入输出。"""
     question: str
     owner_id: int
     context: str
@@ -28,6 +36,7 @@ def retrieve_notes(
     state: AgentState,
     retrieve: Callable[[int, str], list[schemas.NoteRead]],
 ) -> AgentState:
+    """调用注入的检索函数，避免 Agent 层直接依赖 SQLAlchemy。"""
     used_notes = retrieve(state["owner_id"], state["question"])
     context = "\n\n".join(
         f"标题：{note.title}\n内容：{note.content}"
@@ -37,6 +46,7 @@ def retrieve_notes(
 
 
 def generate_answer(state: AgentState) -> AgentState:
+    """同步场景收集所有流式片段，得到一个完整答案。"""
     answer = "".join(stream_answer(state["question"], state["used_notes"]))
     return {**state, "answer": answer}
 
@@ -100,6 +110,7 @@ def _stream_model(
     user_content: str | list[dict[str, Any]],
     model: str | None = None,
 ):
+    """统一模型客户端和流式输出；无密钥时用同协议的分块 Mock 降级。"""
     settings = get_settings()
     if not settings.anthropic_auth_token:
         has_image = isinstance(user_content, list)
@@ -133,6 +144,7 @@ def run_agent(
     question: str,
     note_retriever: Callable[[int, str], list[schemas.NoteRead]],
 ) -> tuple[str, list[schemas.NoteRead]]:
+    """执行最小 RAG 图并返回答案与真实命中的引用快照。"""
     # 用 LangGraph 表达 Agent 编排：检索上下文 -> 模型生成。
     workflow = StateGraph(AgentState)
     workflow.add_node("retrieve_notes", lambda state: retrieve_notes(state, note_retriever))

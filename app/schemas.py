@@ -1,3 +1,9 @@
+"""Pydantic DTO 与统一响应模型。
+
+Schema 是 HTTP 边界的稳定合同：负责输入校验、输出裁剪和序列化；ORM Model 即使
+新增内部字段，也不会未经审查自动返回给浏览器。
+"""
+
 from datetime import UTC, datetime
 from typing import Generic, TypeVar
 
@@ -16,6 +22,7 @@ class ApiResponse(BaseModel, Generic[T]):
 
 
 class UserCreate(BaseModel):
+    """注册入参；bcrypt 对超长密码有限制，因此在接口层限制最大长度。"""
     email: EmailStr
     password: str = Field(min_length=6, max_length=72)
 
@@ -39,6 +46,7 @@ class NoteCreate(BaseModel):
 
 
 class NoteUpdate(BaseModel):
+    """笔记部分更新 DTO；未传字段通过 ``exclude_unset`` 保持原值。"""
     title: str | None = Field(default=None, min_length=1, max_length=200)
     content: str | None = Field(default=None, min_length=1)
 
@@ -82,6 +90,7 @@ class UploadedFileDelete(BaseModel):
 
 
 class AgentMessageRead(BaseModel):
+    """历史消息 DTO，同时暴露引用快照与附件元数据。"""
     id: int
     session_id: int
     role: str

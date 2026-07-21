@@ -1,1 +1,1 @@
-"""AI Agent learning demo package."""
+"""Fieldnote AI Agent 后端应用包。"""

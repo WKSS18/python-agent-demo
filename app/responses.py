@@ -1,3 +1,9 @@
+"""统一 API 响应与全局异常处理。
+
+普通 JSON 接口统一返回 ``{data, code, message}``；SSE 在连接建立后则使用 error
+事件表达失败。服务端日志保留异常堆栈，浏览器只收到脱敏后的可读信息。
+"""
+
 import logging
 from typing import Any, TypeVar
 
@@ -14,6 +20,7 @@ T = TypeVar("T")
 
 
 def success(data: T | None = None, message: str = "success") -> ApiResponse[T]:
+    """构造成功响应信封，让路由无需重复拼装通用字段。"""
     return ApiResponse(data=data, code=status.HTTP_200_OK, message=message)
 
 
@@ -44,6 +51,7 @@ def _error_response(
     message: str,
     headers: dict[str, str] | None = None,
 ) -> JSONResponse:
+    """保证 HTTP 状态、业务 code 与响应内容保持一致。"""
     body = ApiResponse[Any](data=None, code=code, message=message)
     return JSONResponse(
         status_code=code,

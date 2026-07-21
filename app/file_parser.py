@@ -1,3 +1,9 @@
+"""上传文件的安全校验、文本抽取、OCR 与视觉模型预处理。
+
+路由只负责读取字节，本模块把不同格式统一转换为 ``ParsedFile``。这样模型层无需
+了解 PDF/DOCX/Pillow 等实现细节，也便于单独测试文件解析和限制策略。
+"""
+
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -10,6 +16,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from pypdf import PdfReader
 
 
+# 限制原始文件、抽取文本和图片像素，防止超大请求、压缩炸弹与模型费用失控。
 MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_EXTRACTED_CHARS = 60_000
 MAX_IMAGE_PIXELS = 25_000_000
@@ -43,6 +50,7 @@ class ParsedFile:
 
 @dataclass(frozen=True)
 class ValidatedUpload:
+    """完成基础安全检查后的文件元数据。"""
     name: str
     suffix: str
     media_type: str
@@ -120,6 +128,7 @@ def parse_uploaded_file(filename: str | None, media_type: str | None, content: b
 
 
 def _decode_text(content: bytes) -> str:
+    """优先兼容 UTF-8 BOM，再兼容常见中文 GB18030 编码。"""
     for encoding in ("utf-8-sig", "gb18030"):
         try:
             return content.decode(encoding)
@@ -129,6 +138,7 @@ def _decode_text(content: bytes) -> str:
 
 
 def _extract_pdf(content: bytes) -> str:
+    """最多读取前 100 页；扫描型 PDF 没有文本层时会得到空字符串。"""
     reader = PdfReader(BytesIO(content))
     if reader.is_encrypted:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="暂不支持加密 PDF。")
@@ -154,6 +164,7 @@ def _extract_docx(content: bytes) -> str:
 
 
 def _extract_image_ocr(content: bytes) -> str:
+    """优先使用中英混合 OCR；未安装中文语言包时自动降级为英文。"""
     try:
         Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
         with Image.open(BytesIO(content)) as image:

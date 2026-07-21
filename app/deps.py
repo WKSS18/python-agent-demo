@@ -1,3 +1,5 @@
+"""FastAPI 可复用依赖，集中完成 Bearer Token 解析和当前用户加载。"""
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -14,6 +16,7 @@ def get_current_user(
     token: str | None = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ) -> models.User:
+    """返回当前有效用户；缺失、过期或用户已删除都按 401 处理。"""
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

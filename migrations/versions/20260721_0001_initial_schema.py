@@ -1,4 +1,4 @@
-"""Create the initial application schema.
+"""创建用户、笔记、Agent 会话和消息的初始表结构。
 
 Revision ID: 20260721_0001
 Revises: None
@@ -18,6 +18,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    """按父子依赖顺序创建业务表、外键和查询索引。"""
     """Create users, notes, agent sessions, and agent messages."""
     op.create_table(
         "users",
@@ -72,6 +73,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """按创建的逆序删除索引和表，避免外键依赖冲突。"""
     """Drop all application tables in reverse dependency order."""
     # MySQL removes a table's indexes and foreign keys with the table. Dropping
     # an FK-backed index first fails because the still-present FK requires it.

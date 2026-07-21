@@ -1,3 +1,5 @@
+"""Alembic 运行环境：复用应用数据库 URL，并向迁移工具暴露 ORM metadata。"""
+
 from logging.config import fileConfig
 
 from alembic import context
@@ -17,7 +19,7 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    """Generate SQL without opening a database connection."""
+    """离线模式只生成 SQL，不建立真实数据库连接。"""
     context.configure(
         url=settings.database_url,
         target_metadata=target_metadata,
@@ -31,7 +33,7 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations using a short-lived, non-pooled connection."""
+    """在线模式使用短生命周期、无连接池的连接执行迁移。"""
     connectable = create_engine(settings.database_url, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:

@@ -1,3 +1,10 @@
+"""业务服务层与事务边界。
+
+Route 只负责 HTTP，CRUD 只负责 SQL；本模块负责权限、幂等、事务和跨模块编排。
+流式模型调用使用独立 Session，并在模型调用前后拆分短事务，避免等待模型时长期
+占用数据库连接或持有锁。
+"""
+
 import json
 import logging
 from collections.abc import Generator
@@ -33,6 +40,7 @@ class BaseService:
 
 
 class AuthService(BaseService):
+    """注册与登录业务；数据库唯一索引兜底并发注册竞争。"""
     def register(self, data: schemas.UserCreate) -> models.User:
         if crud.get_user_by_email(self.db, data.email):
             raise HTTPException(
@@ -66,6 +74,7 @@ class AuthService(BaseService):
 
 
 class NoteService(BaseService):
+    """知识笔记 CRUD，并统一校验 ``owner_id`` 防止水平越权。"""
     def create(self, owner_id: int, data: schemas.NoteCreate) -> models.Note:
         note = crud.add_note(
             self.db,
@@ -102,11 +111,13 @@ class NoteService(BaseService):
 
 
 class AgentService(BaseService):
+    """会话、消息、RAG、文件分析和结构化表单的应用服务。"""
     def chat(
         self,
         owner_id: int,
         data: schemas.AgentChatRequest,
     ) -> schemas.AgentChatResponse:
+        """非流式兼容接口：保存提问、执行 Agent、保存完整回答。"""
         session_id = self._save_user_message(owner_id, data)
 
         answer, used_notes = agent.run_agent(
@@ -131,6 +142,7 @@ class AgentService(BaseService):
         )
 
     def list_messages(self, owner_id: int, session_id: int) -> list[schemas.AgentMessageRead]:
+        """恢复历史消息，并为每个私有 OSS 附件刷新签名 URL。"""
         self._get_owned_session(owner_id, session_id)
         storage = OssStorage()
         result: list[schemas.AgentMessageRead] = []
@@ -145,6 +157,7 @@ class AgentService(BaseService):
         owner_id: int,
         data: schemas.AgentNoteFormSubmit,
     ) -> models.Note:
+        """在同一事务中完成“创建笔记 + 标记表单完成”，并支持重复提交幂等。"""
         message = crud.get_owned_agent_message_for_update(
             self.db,
             message_id=data.message_id,
@@ -355,6 +368,7 @@ class AgentService(BaseService):
         data: schemas.AgentChatRequest,
         message_data: dict | None = None,
     ) -> int:
+        """创建/校验会话并优先持久化用户消息，保证刷新后输入不会丢失。"""
         try:
             if data.session_id is None:
                 session = crud.add_agent_session(self.db, owner_id, data.question)
@@ -376,6 +390,7 @@ class AgentService(BaseService):
             raise
 
     def _retrieve_note_snapshots(self, owner_id: int, question: str) -> list[schemas.NoteRead]:
+        """只返回真实关键字命中的笔记快照；无命中时让模型用自身知识回答。"""
         keyword_notes = crud.list_notes(self.db, owner_id=owner_id, keyword=question)
         # 没有真实命中时不得用“最近笔记”冒充引用，交给模型自身知识回答。
         selected_notes = keyword_notes[:5]
@@ -386,6 +401,7 @@ class AgentService(BaseService):
         return snapshots
 
     def _get_owned_session(self, owner_id: int, session_id: int) -> models.AgentSession:
+        """集中执行会话归属检查，对不存在和无权访问统一返回 404。"""
         session = crud.get_agent_session(self.db, session_id)
         if not session or session.owner_id != owner_id:
             raise HTTPException(
