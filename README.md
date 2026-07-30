@@ -32,7 +32,7 @@
 | 模型 | Anthropic Python SDK | 调用 Anthropic Messages 兼容接口 |
 | 文件 | PyPDF、Pillow、pytesseract | PDF 提取、图片处理和 OCR |
 | 存储 | oss2 | 阿里云 OSS 私有对象和签名 URL |
-| 数据库默认值 | SQLite | 零依赖本地运行；可通过 URL 切换 MySQL |
+| 数据库 | SQLite / MySQL 8 | SQLite 用于本地开发；Compose 准生产环境使用 MySQL |
 
 ## 3. 总体架构
 
@@ -159,7 +159,7 @@ OSS_SIGNED_URL_EXPIRE_SECONDS=3600
 - `VITE_` 前缀变量会进入浏览器构建产物，绝不能把模型或 OSS 长期密钥放到前端。
 - 已经在聊天或截图中暴露过的 AccessKey/Token 应立即在云平台轮换。
 
-### 6.1 可选 MySQL
+### 6.1 MySQL
 
 应用使用 SQLAlchemy，替换连接 URL 即可切换 MySQL：
 
@@ -173,7 +173,48 @@ DATABASE_URL=mysql+pymysql://app_user:URL编码后的密码@127.0.0.1:3306/ai_ag
 alembic upgrade head
 ```
 
-README 不把 MySQL 描述成默认已启用；当前实际数据库由本机 `.env` 的 `DATABASE_URL` 决定。
+本地开发默认使用 SQLite；准生产环境必须使用 MySQL。`APP_ENV=production`
+时应用会拒绝 SQLite、示例密钥和长度不足 32 位的 `SECRET_KEY`。
+
+连接池可通过以下变量调整：
+
+```dotenv
+DB_POOL_SIZE=10
+DB_MAX_OVERFLOW=20
+DB_POOL_TIMEOUT_SECONDS=30
+DB_POOL_RECYCLE_SECONDS=1800
+```
+
+MySQL 连接默认启用连接存活检查和定期回收，避免数据库关闭空闲连接后应用继续复用
+失效连接。
+
+### 6.2 Docker Compose 准生产部署
+
+仓库提供 API、MySQL 8 和独立迁移任务。首次启动：
+
+```bash
+cp .env.production.example .env.production
+# 编辑 .env.production，替换所有示例密码、SECRET_KEY、模型和 OSS 配置。
+docker compose up -d --build
+docker compose ps
+curl http://127.0.0.1:8000/ready
+```
+
+生成随机 JWT 密钥：
+
+```bash
+openssl rand -hex 32
+```
+
+注意：
+
+- `MYSQL_PASSWORD` 如果包含 URL 特殊字符，写入 `DATABASE_URL` 时必须进行 URL 编码。
+- MySQL 数据保存在具名卷 `mysql_data`，重建 API 容器不会删除数据库。
+- `migrate` 服务在 API 启动前执行一次 `alembic upgrade head`。
+- `/health` 是进程存活探针，`/ready` 会执行 `SELECT 1` 检查数据库。
+- Compose 是单机准生产方案；正式公网环境仍应在前面配置 HTTPS 反向代理、备份、
+  日志收集和监控告警。
+- 如果需要信任反向代理头，只允许明确的代理地址或网段，不要信任任意来源。
 
 ## 7. 数据模型
 

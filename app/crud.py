@@ -103,3 +103,19 @@ def list_agent_messages(db: Session, session_id: int) -> list[models.AgentMessag
         .order_by(models.AgentMessage.id.asc())
     )
     return list(db.scalars(query))
+
+
+def list_recent_agent_messages(
+    db: Session,
+    session_id: int,
+    limit: int = 8,
+) -> list[models.AgentMessage]:
+    """取最近 N 条消息作为短期记忆，再恢复为自然对话顺序。"""
+    query = (
+        select(models.AgentMessage)
+        .where(models.AgentMessage.session_id == session_id)
+        .order_by(models.AgentMessage.id.desc())
+        .limit(limit)
+    )
+    messages = list(db.scalars(query))
+    return list(reversed(messages))

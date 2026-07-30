@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.config import get_settings
-from app.database import get_db
+from app.database import check_database_connection, get_db
 from app.deps import get_current_user
 from app.file_parser import parse_uploaded_file
 from app.responses import register_exception_handlers, success
@@ -30,7 +30,21 @@ register_exception_handlers(app)
 
 @app.get("/health", response_model=schemas.ApiResponse[dict[str, str]])
 def health_check() -> schemas.ApiResponse[dict[str, str]]:
+    """存活探针：只证明应用进程仍能响应。"""
     return success({"status": "ok"})
+
+
+@app.get("/ready", response_model=schemas.ApiResponse[dict[str, str]])
+def readiness_check() -> schemas.ApiResponse[dict[str, str]]:
+    """就绪探针：数据库可连接时才允许流量进入。"""
+    try:
+        check_database_connection()
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="数据库暂不可用",
+        ) from error
+    return success({"status": "ready"})
 
 
 @app.post("/auth/register", response_model=schemas.ApiResponse[schemas.UserRead])

@@ -27,6 +27,7 @@ class AgentState(TypedDict):
     """LangGraph 节点之间共享的显式状态，便于检查每一步输入输出。"""
     question: str
     owner_id: int
+    memory: str
     context: str
     used_notes: list[schemas.NoteRead]
     answer: str
@@ -47,11 +48,15 @@ def retrieve_notes(
 
 def generate_answer(state: AgentState) -> AgentState:
     """同步场景收集所有流式片段，得到一个完整答案。"""
-    answer = "".join(stream_answer(state["question"], state["used_notes"]))
+    answer = "".join(stream_answer(state["question"], state["used_notes"], state["memory"]))
     return {**state, "answer": answer}
 
 
-def stream_answer(question: str, used_notes: list[schemas.NoteRead]):
+def stream_answer(
+    question: str,
+    used_notes: list[schemas.NoteRead],
+    memory: str = "",
+):
     """逐段产出模型文本；Service 决定如何传输和持久化这些文本。"""
     context = "\n\n".join(
         f"标题：{note.title}\n内容：{note.content}"
@@ -59,6 +64,7 @@ def stream_answer(question: str, used_notes: list[schemas.NoteRead]):
     )
 
     user_content = (
+        f"会话记忆：\n{memory or '（无历史对话）'}\n\n"
         f"问题：{question}\n\n"
         f"notes 上下文：\n{context or '（没有检索到相关笔记，请使用模型自身知识回答）'}"
     )
@@ -143,6 +149,7 @@ def run_agent(
     owner_id: int,
     question: str,
     note_retriever: Callable[[int, str], list[schemas.NoteRead]],
+    memory: str = "",
 ) -> tuple[str, list[schemas.NoteRead]]:
     """执行最小 RAG 图并返回答案与真实命中的引用快照。"""
     # 用 LangGraph 表达 Agent 编排：检索上下文 -> 模型生成。
@@ -158,6 +165,7 @@ def run_agent(
         {
             "question": question,
             "owner_id": owner_id,
+            "memory": memory,
             "context": "",
             "used_notes": [],
             "answer": "",

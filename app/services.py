@@ -14,7 +14,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import agent, chat_forms, crud, models, schemas
+from app import agent, chat_forms, crud, models, rag, schemas
 from app.config import get_settings
 from app.database import SessionLocal
 from app.file_parser import ParsedFile
@@ -119,11 +119,13 @@ class AgentService(BaseService):
     ) -> schemas.AgentChatResponse:
         """非流式兼容接口：保存提问、执行 Agent、保存完整回答。"""
         session_id = self._save_user_message(owner_id, data)
+        memory = self._build_memory_snapshot(session_id, data.question)
 
         answer, used_notes = agent.run_agent(
             owner_id=owner_id,
             question=data.question,
             note_retriever=self._retrieve_note_snapshots,
+            memory=memory,
         )
 
         crud.add_agent_message(
@@ -235,14 +237,18 @@ class AgentService(BaseService):
                 yield _sse_event("done", {"message_id": message.id})
                 return
 
+            memory = service._build_memory_snapshot(session_id, data.question)
             used_notes = service._retrieve_note_snapshots(owner_id, data.question)
+            # 查询会自动开启事务；模型生成可能持续数分钟，先结束只读事务，
+            # 将连接归还连接池，生成完成后再使用当前 Session 开启短写事务。
+            db.commit()
             yield _sse_event(
                 "sources",
                 {"used_notes": [note.model_dump(mode="json") for note in used_notes]},
             )
 
             answer_parts: list[str] = []
-            for text_delta in agent.stream_answer(data.question, used_notes):
+            for text_delta in agent.stream_answer(data.question, used_notes, memory):
                 answer_parts.append(text_delta)
                 yield _sse_event("delta", {"content": text_delta})
 
@@ -390,15 +396,29 @@ class AgentService(BaseService):
             raise
 
     def _retrieve_note_snapshots(self, owner_id: int, question: str) -> list[schemas.NoteRead]:
-        """只返回真实关键字命中的笔记快照；无命中时让模型用自身知识回答。"""
-        keyword_notes = crud.list_notes(self.db, owner_id=owner_id, keyword=question)
-        # 没有真实命中时不得用“最近笔记”冒充引用，交给模型自身知识回答。
-        selected_notes = keyword_notes[:5]
+        """用混合 RAG 召回当前用户笔记；无命中时让模型用自身知识回答。"""
+        all_notes = crud.list_notes(self.db, owner_id=owner_id)
+        retrieved_notes = rag.retrieve_notes(question, all_notes, limit=5)
+        selected_notes = [item.note for item in retrieved_notes]
 
         # 转成 DTO 后结束读事务，避免慢速模型调用长期占用数据库连接和事务。
         snapshots = [schemas.NoteRead.model_validate(note) for note in selected_notes]
         self.db.rollback()
         return snapshots
+
+    def _build_memory_snapshot(self, session_id: int, current_question: str) -> str:
+        """取最近对话作为短期记忆，并避免把当前问题重复塞进 prompt。"""
+        messages = crud.list_recent_agent_messages(self.db, session_id=session_id, limit=9)
+        if messages and messages[-1].role == "user" and messages[-1].content == current_question:
+            messages = messages[:-1]
+
+        memory_lines: list[str] = []
+        for message in messages[-8:]:
+            role = "用户" if message.role == "user" else "助手"
+            content = message.content.strip().replace("\n", " ")
+            if content:
+                memory_lines.append(f"{role}: {content[:500]}")
+        return "\n".join(memory_lines)
 
     def _get_owned_session(self, owner_id: int, session_id: int) -> models.AgentSession:
         """集中执行会话归属检查，对不存在和无权访问统一返回 404。"""

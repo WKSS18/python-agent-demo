@@ -5,20 +5,20 @@
 
 ## 1. 项目一句话概括
 
-这是一个 FastAPI + React 的 AI Agent 全栈项目，使用 SQLAlchemy 和 MySQL 持久化数据，bcrypt 和 JWT 完成认证，LangGraph 编排“检索用户笔记→生成回答”，并通过 SSE 流式返回文本或结构化表单消息。
+这是一个 FastAPI + React 的 AI Agent 全栈项目，使用 SQLAlchemy 和 MySQL 持久化数据，bcrypt 和 JWT 完成认证，LangGraph 编排“短期记忆→混合 RAG 检索用户笔记→调用 LLM 生成回答”，并通过 SSE 流式返回文本或结构化表单消息。
 
 ## 2. 可直接复述的面试话术
 
 ### 2.1 30 秒版
 
-> 我做了一个 FastAPI + React 的 AI Agent 项目。数据层用 SQLAlchemy 连接 MySQL，实现注册、JWT 鉴权、笔记 CRUD 和 Agent 问答。Agent 先检索当前用户的 Notes，再用 LangGraph 编排并调用 Anthropic 兼容模型；聊天通过 SSE 增量返回，前端还能按消息类型渲染可操作表单。没有 API Key 时可以用 Mock 调试同一套流式链路。
+> 我做了一个 FastAPI + React 的 AI Agent 项目。数据层用 SQLAlchemy 连接 MySQL，实现注册、JWT 鉴权、笔记 CRUD 和 Agent 问答。Agent 会从当前会话恢复短期记忆，再对用户 Notes 做关键词和向量相似度的混合 RAG 召回，最后通过 Anthropic Messages 兼容协议流式调用模型；聊天通过 SSE 增量返回，前端还能按消息类型渲染可操作表单。没有 API Key 时可以用 Mock 调试同一套流式链路。
 
 ### 2.2 2 分钟版
 
 > 这个项目的目标是将常见 Python Web 能力和 AI Agent 链路放在一个可运行的小型项目中。  
 > 在架构上，`main.py` 只负责路由、参数接收和响应；Pydantic Schema 负责输入输出校验；CRUD 层只做数据访问；Service 层集中业务规则和事务边界；SQLAlchemy Model 定义表和关系；`security.py` 负责密码哈希和 JWT；`deps.py` 通过 FastAPI 依赖注入统一获取当前用户。  
 > 用户注册时，密码用 bcrypt 做单向哈希后再入库；登录成功后签发带过期时间的 JWT。Notes 和 Agent Session 都通过 `owner_id` 和当前用户绑定，查询和修改时会再校验归属，防止水平越权。  
-> Agent 目前有两个节点：第一个节点从当前用户的 Notes 中检索上下文，第二个节点调用模型生成答案。这个流程用 LangGraph 表达，后续可以在图中增加向量检索、rerank、工具调用、审核和重试节点。  
+> Agent 目前有两个节点：第一个节点从当前用户的 Notes 中检索上下文，第二个节点调用模型生成答案。Service 层会先把最近几轮消息整理成短期记忆，检索层用本地哈希向量模拟 embedding 并和关键词分数做混合排序。这个流程用 LangGraph 表达，后续可以在图中增加持久化向量库、rerank、工具调用、审核和重试节点。  
 > 数据库已从开发时的 SQLite 切换到本地 MySQL 8.4，使用独立应用账号和 `utf8mb4`，并完成了注册写入、登录读取和数据库查询验证。
 
 ### 2.3 为什么做这个项目
@@ -158,9 +158,12 @@ ORM 关系上配置了 `cascade="all, delete-orphan"`，代表从 ORM 删除父�
 - 本机已安装 MySQL 8.4 LTS。
 - MySQL 通过 Homebrew Service 后台运行。
 - 数据库名为 `ai_agent_demo`，字符集为 `utf8mb4`。
-- 应用使用独立数据库账号，不直接使用 root。
+- 本地开发 `.env` 已配置 `mysql+pymysql://ai_agent_app:***@127.0.0.1:3306/ai_agent_demo?charset=utf8mb4`。
+- 应用使用独立数据库账号 `ai_agent_app`，不直接使用 root。
+- root 账号只用于本地数据库管理，不写入项目配置，也不应该在面试或演示中展示密码。
 - `.env` 中的 `DATABASE_URL` 已从 SQLite URL 改为 MySQL URL。
-- 已通过真实注册、MySQL 查询和登录完成端到端验证。
+- 已执行 `alembic upgrade head`，MySQL 中存在 `users`、`notes`、`agent_sessions`、`agent_messages` 和 `alembic_version` 表。
+- 已通过 `app.database.check_database_connection()` 验证应用账号能连接 MySQL。
 
 ### 7.2 连接字符串
 
@@ -175,6 +178,16 @@ DATABASE_URL=mysql+pymysql://<user>:<url-encoded-password>@127.0.0.1:3306/ai_age
 - `charset=utf8mb4`：支持完整 Unicode，包括四字节字符。
 - 密码中的 `!`、`@`、`:` 等特殊字符应做 URL 编码。
 
+本地验证常用命令：
+
+```bash
+brew services list
+mysql -h 127.0.0.1 -u ai_agent_app -p ai_agent_demo
+alembic upgrade head
+```
+
+面试时不要展示 `.env`、root 密码、OSS 密钥或模型 API Key。可以只说“项目使用独立应用账号连接 MySQL，root 仅用于本地管理”。
+
 ### 7.3 从 SQLite 切换到 MySQL 为什么代码改动很小
 
 `database.py` 通过 SQLAlchemy `create_engine(settings.database_url)` 创建引擎，业务代码使用 ORM 查询，没有大量依赖 SQLite 的原生 SQL。因此切换的核心是：
@@ -187,6 +200,12 @@ DATABASE_URL=mysql+pymysql://<user>:<url-encoded-password>@127.0.0.1:3306/ai_age
 
 SQLite 需要 `check_same_thread=False`，而 MySQL 不需要，所以项目只在 URL 以 `sqlite` 开头时增加该参数。
 
+本项目在 `database.py` 中还针对非 SQLite 连接启用了连接池配置：
+
+- `pool_pre_ping=True`：借出连接前先检查连接是否仍然有效。
+- `pool_recycle`：定期回收连接，减少 MySQL 空闲连接超时带来的错误。
+- `pool_size`、`max_overflow`、`pool_timeout`：控制连接池容量和等待时间。
+
 ### 7.4 Alembic 数据库迁移
 
 当前项目已使用 Alembic 取代 FastAPI 启动时的 `Base.metadata.create_all()`。首次启动或发布新版本前执行：
@@ -194,6 +213,8 @@ SQLite 需要 `check_same_thread=False`，而 MySQL 不需要，所以项目只�
 ```bash
 alembic upgrade head
 ```
+
+当前本地 MySQL 已执行到最新迁移，表结构由 `migrations/versions/` 中的版本脚本创建和维护。
 
 修改 ORM Model 后，使用 `alembic revision --autogenerate` 对比当前数据库和 `Base.metadata`，生成候选迁移文件。自动生成结果必须人工审查，再执行 upgrade。Alembic 的价值是：
 
@@ -299,12 +320,17 @@ for key, value in update_data.items():
    |  提交第一个短事务
    |
    v
+构造短期记忆
+   |  从当前 session 最近消息中排除本次问题
+   |
+   v
 retrieve_notes
-   |  关键词检索当前用户 Notes
-   |  无命中则取最近 3 条作为 fallback
+   |  当前用户 Notes -> 切块 -> 本地哈希向量 -> 关键词 + 向量混合排序
+   |  无真实命中则不返回引用，让模型用自身知识回答
    v
 generate_answer
-   |  有 API Key: Anthropic SDK text_stream
+   |  system prompt + 会话记忆 + notes 上下文 + 当前问题
+   |  有 API Key: Anthropic SDK messages.stream().text_stream
    |  无 API Key: 本地 Mock
    |  每个文本增量发送 SSE delta
    v
@@ -317,6 +343,8 @@ generate_answer
 
 若问题命中“创建笔记”白名单意图，会跳过模型调用，直接发送结构化 `form` 事件。表单的 `kind` 和字段由服务端控制，前端按类型映射组件并调用受鉴权的 Notes API。
 
+面试时可以强调一个工程取舍：外部模型调用可能持续数秒甚至数分钟，所以项目先提交用户消息，再结束 Notes 查询产生的只读事务，等模型生成结束后才开启短写事务保存 assistant message。这样不会在等待模型时长期占用 MySQL 连接和事务锁。
+
 ### 10.2 AgentState 的作用
 
 `AgentState` 是节点之间传递的显式状态：
@@ -325,8 +353,9 @@ generate_answer
 class AgentState(TypedDict):
     question: str
     owner_id: int
+    memory: str
     context: str
-    used_notes: list[models.Note]
+    used_notes: list[schemas.NoteRead]
     answer: str
 ```
 
@@ -337,22 +366,188 @@ class AgentState(TypedDict):
 - 便于测试某个节点的纯逻辑。
 - 便于记录每个阶段的中间结果。
 
-### 10.3 当前检索是不是 RAG
+当前 LangGraph 图仍保持两节点：
 
-它是一个“类 RAG”的最小链路，因为它确实先检索用户数据，再将上下文提供给生成模型。但当前只是 SQL `LIKE` 关键词匹配，不是完整语义 RAG。
+1. `retrieve_notes`：调用注入的检索函数，不直接依赖 SQLAlchemy，降低 Agent 层和数据库层耦合。
+2. `generate_answer`：把 `question`、`memory`、`used_notes` 组织成 prompt，然后流式调用模型。
+
+后续如果要扩展，可以在图中增加：
+
+- `rewrite_query`：根据历史对话改写用户问题。
+- `retrieve_vector`：从向量库召回候选 chunks。
+- `rerank`：用 reranker 对候选上下文重新排序。
+- `tool_call`：需要查天气、查订单、查数据库时调用工具。
+- `guardrail`：输出前做安全、引用完整性或格式检查。
+- `summarize_memory`：长会话超过窗口后压缩历史记忆。
+
+### 10.3 LLM 调用怎么实现
+
+项目把模型调用集中放在 `app/agent.py` 的 `_stream_model()`：
+
+```python
+client = Anthropic(
+    api_key=settings.anthropic_auth_token,
+    base_url=settings.anthropic_base_url,
+    timeout=settings.api_timeout_ms / 1000,
+)
+with client.messages.stream(
+    model=model or settings.anthropic_model,
+    max_tokens=2_048,
+    system=system_prompt,
+    messages=[{"role": "user", "content": user_content}],
+) as stream:
+    yield from stream.text_stream
+```
+
+关键点：
+
+- 协议：使用 Anthropic Messages API。`system` 单独传系统提示词，用户输入放到 `messages`。
+- 供应商切换：`base_url` 从配置读取，兼容 Anthropic 协议的网关或模型服务可以替换。
+- 流式输出：`messages.stream()` 返回增量文本，后端通过 Python generator 一段段 `yield`，路由层再包装成 SSE。
+- 超时：`api_timeout_ms` 集中配置，避免模型长时间无响应拖死请求。
+- Mock 降级：没有 `ANTHROPIC_AUTH_TOKEN` 时仍按分块流式返回本地 Mock，前端不用维护两套逻辑。
+- 多模态：文件分析接口在开启视觉模型时把图片 base64 放到 content 列表里，文本和图片走同一个 `_stream_model()`。
+
+面试追问“为什么不在 route 里直接调 LLM”时，可以这样答：
+
+> Route 只处理 HTTP 协议，LLM 客户端、prompt 组织和 mock 降级放在 Agent 层。这样普通 JSON 接口、SSE 接口、文件分析和测试都能复用同一套模型适配逻辑。
+
+### 10.4 记忆怎么实现
+
+项目里有两类记忆：
+
+| 类型 | 当前实现 | 作用 |
+| --- | --- | --- |
+| 短期记忆 | `agent_messages` 中最近几轮会话，由 `AgentService._build_memory_snapshot()` 拼成 prompt | 让模型理解上下文，例如“继续解释刚才那个方案” |
+| 长期记忆/知识记忆 | 用户主动创建的 `notes`，通过 RAG 召回 | 让模型回答和用户个人知识库相关的问题 |
+
+短期记忆不是存在 Python 全局变量里，而是来自数据库消息表：
+
+```text
+agent_sessions 1 ---- N agent_messages
+```
+
+调用 `/agent/chat/stream` 时，服务层先保存当前用户问题，然后读取最近 9 条消息，排除刚刚保存的本次问题，最多保留最近 8 条历史消息：
+
+```python
+messages = crud.list_recent_agent_messages(self.db, session_id=session_id, limit=9)
+if messages and messages[-1].role == "user" and messages[-1].content == current_question:
+    messages = messages[:-1]
+```
+
+这样做的好处：
+
+- 刷新页面后历史上下文仍然存在。
+- 多个会话之间通过 `session_id` 隔离。
+- 不依赖单进程内存，后端重启后仍可恢复。
+- 可以控制最近 N 条，避免把完整历史塞进 prompt 导致 token 爆炸。
+
+当前短期记忆是“滑动窗口”。生产环境可以升级为：
+
+1. 滑动窗口 + 摘要记忆：最近消息原文保留，较早消息压缩成 summary。
+2. 用户画像记忆：把稳定偏好单独抽取，例如语言、技术栈、项目背景。
+3. 可删除记忆：给用户提供查看、修改和删除长期记忆的能力。
+4. 记忆权限隔离：所有记忆必须带 `owner_id/session_id`，不能跨用户串数据。
+
+### 10.5 当前检索是不是 RAG
+
+它是一个轻量 RAG 链路，因为它确实先检索当前用户数据，再将上下文提供给生成模型。现在已经不只是 SQL `LIKE`，而是在 `app/rag.py` 中实现了请求内临时向量索引：
+
+```text
+用户问题
+  -> tokenize
+  -> 本地哈希向量 embed
+
+当前用户 Notes
+  -> title + content
+  -> chunk
+  -> 本地哈希向量 embed
+  -> cosine similarity
+  -> keyword overlap
+  -> hybrid score
+  -> topK notes
+```
+
+这里的“向量”不是调用商业 embedding API，而是用 hashing trick 生成固定维度向量，目的是在不增加外部服务的情况下，把 RAG 的核心流程体现在代码里：
+
+- `_chunk_note()`：把长 Note 切成有 overlap 的 chunk。
+- `_embed()`：把 token hash 到 256 维向量，并做归一化。
+- `_cosine_similarity()`：计算 query 向量和 chunk 向量的余弦相似度。
+- `_keyword_overlap()`：补充精确关键词匹配，避免纯向量召回漂移。
+- `retrieve_notes()`：按混合分数排序，同一 Note 只保留最高分 chunk。
+
+当前混合分数：
+
+```text
+score = keyword_score * 0.55 + vector_score * 0.45
+```
+
+这个权重不是固定真理，只是 Demo 里的保守选择：关键词更可解释，向量召回能处理近义表达。真实项目会通过离线评测集调权重、阈值和 topK。
+
+当前实现有一个重要原则：没有真实命中的 Notes 时，不用“最近笔记”冒充引用，而是明确给模型传入空上下文，让模型基于自身知识回答。这样历史消息里的引用来源更可信。
 
 完整 RAG 可以扩展为：
 
 1. 文档切分和清洗。
-2. Embedding 并写入向量库。
-3. Query 改写。
-4. 向量召回 + 关键词召回的混合检索。
-5. Rerank。
-6. 上下文去重、截断和 Token 预算。
-7. 模型生成并返回引用。
-8. 质量评估和反馈闭环。
+2. 调用 embedding 模型，例如 `text-embedding-3-large` 或供应商等价模型。
+3. 将 chunk、embedding、metadata 写入向量库。
+4. Query 改写，处理“它/这个/刚才”的指代。
+5. 向量召回 + 关键词召回的混合检索。
+6. Rerank。
+7. 上下文去重、截断和 Token 预算。
+8. 模型生成并返回引用。
+9. 质量评估和反馈闭环。
 
-### 10.4 为什么要有 Mock 降级
+### 10.6 生产向量库会怎么设计
+
+如果从当前 Demo 升级为真正向量 RAG，可以新增一张 chunk 表或接入向量库：
+
+| 字段 | 说明 |
+| --- | --- |
+| id | chunk 主键 |
+| owner_id | 用户隔离字段 |
+| note_id | 来源 Note |
+| chunk_index | Note 内顺序 |
+| content | chunk 文本 |
+| embedding | 向量，维度由 embedding 模型决定 |
+| content_hash | 判断内容是否变化，避免重复 embedding |
+| created_at / updated_at | 索引维护时间 |
+
+写入流程：
+
+```text
+创建/更新 Note
+  -> 清洗文本
+  -> 按段落/token 切 chunk
+  -> 计算 content_hash
+  -> 内容变化才重新 embedding
+  -> upsert 到向量库
+  -> 删除旧 chunk
+```
+
+查询流程：
+
+```text
+用户问题 + 短期记忆
+  -> 可选 query rewrite
+  -> query embedding
+  -> vector topK
+  -> keyword topK
+  -> merge + dedupe
+  -> rerank
+  -> 按 token 预算组装上下文
+  -> LLM answer
+```
+
+生产环境必须注意：
+
+- `owner_id` 必须参与过滤，防止跨用户召回。
+- embedding 和 LLM 可以是两个模型，embedding 模型要稳定，频繁更换会导致旧向量不可比。
+- chunk 不能太大，否则召回不准；也不能太小，否则上下文碎片化。
+- 向量库只解决召回，不保证答案正确，仍要在 prompt 中要求“只基于提供上下文引用”。
+- 需要记录命中的 chunk id、score 和来源，便于排查 hallucination 和召回质量。
+
+### 10.7 为什么要有 Mock 降级
 
 - 没有 API Key 时仍可以联调注册、鉴权、Notes 检索、会话和消息入库。
 - 自动化测试不必依赖外部网络和付费 API。
@@ -382,13 +577,13 @@ class AgentState(TypedDict):
 
 ## 12. HTTP 状态码设计
 
-- `200 OK`：查询、登录和普通成功请求。
-- `201 Created`：用户或 Note 创建成功。
-- `204 No Content`：删除成功，不返回响应体。
+- `200 OK`：当前普通 JSON 成功接口统一返回 200，并用 `{data, code, message}` 作为响应信封。
 - `401 Unauthorized`：token 缺失、无效、过期或登录失败。
 - `404 Not Found`：资源不存在或不属于当前用户。
 - `409 Conflict`：注册邮箱已存在。
 - `422 Unprocessable Entity`：Pydantic/FastAPI 参数校验失败。
+
+生产化可以进一步细化成功状态码，例如创建返回 `201 Created`、删除返回 `204 No Content`。当前项目为了前端统一解析，创建、删除等成功结果也包装为统一响应体。
 
 ## 13. 项目中实际解决的问题
 
@@ -414,7 +609,7 @@ class AgentState(TypedDict):
 
 面试可说：
 
-> 健康检查成功不代表核心业务可用。我在接入 MySQL 后做了真实写入链路，才发现密码依赖冲突。修复后又验证了注册写库和登录读库，这比只验证端口是否打开更可靠。
+> 健康检查成功不代表核心业务可用。接入 MySQL 后不仅要验证端口和 `SELECT 1`，还要跑注册、登录、Notes 写入这类真实业务链路，因为依赖冲突或事务问题通常只有走到核心代码才会暴露。
 
 ## 14. 可能的面试追问与参考回答
 
@@ -456,7 +651,7 @@ class AgentState(TypedDict):
 
 ### 14.10 如果 Notes 数据量很大怎么优化？
 
-> 首先不能一次查所有 Notes，要增加分页和 SQL `LIMIT`。关键词检索可考虑 MySQL Full-Text Index 或 Elasticsearch；语义检索可以将 Note 切块并写入向量库。同时通过离线 embedding、候选召回数限制、rerank 和 Token 预算控制延迟和成本。
+> 首先不能像 Demo 这样每次把当前用户全部 Notes 拉到进程内临时建索引，要把 chunk 和 embedding 持久化到向量库或支持向量索引的数据库里。关键词检索可用 MySQL Full-Text Index 或 Elasticsearch，语义检索用向量 topK，再做 merge、dedupe、rerank 和 Token 预算控制。还要按 `owner_id` 做强过滤，避免跨用户召回。
 
 ## 15. 当前局限与生产化改进
 
@@ -542,6 +737,6 @@ Swagger 地址：`http://127.0.0.1:8000/docs`
 - 能说清 Session、commit、refresh 和 rollback。
 - 能说清 SQLite 切换 MySQL 时改了什么。
 - 能区分 `create_all` 和 Alembic Migration。
-- 能说清 AgentState、节点、边和 Mock 降级。
-- 能承认当前是 LIKE 检索，并说出完整 RAG 的升级方案。
+- 能说清 AgentState、节点、边、SSE 流式调用和 Mock 降级。
+- 能说清短期记忆、长期知识记忆、混合 RAG 和生产向量库升级方案。
 - 能说出至少 3 个当前局限和对应改进方案。

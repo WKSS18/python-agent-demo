@@ -7,6 +7,7 @@
 
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +20,10 @@ class Settings(BaseSettings):
     secret_key: str = "change-me-in-production"
     access_token_expire_minutes: int = 120
     database_url: str = "sqlite:///./ai_agent_demo.db"
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_timeout_seconds: int = 30
+    db_pool_recycle_seconds: int = 1_800
     # 模型配置：项目通过 Anthropic Messages 兼容协议调用服务，base_url 可替换供应商。
     anthropic_auth_token: str = ""
     anthropic_base_url: str = "https://api.anthropic.com"
@@ -44,6 +49,26 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @property
+    def is_production(self) -> bool:
+        """生产环境启用更严格的启动检查。"""
+        return self.app_env.lower() in {"production", "prod"}
+
+    @model_validator(mode="after")
+    def validate_production_settings(self) -> "Settings":
+        """尽早拒绝危险的生产默认值，避免服务带着弱配置启动。"""
+        if not self.is_production:
+            return self
+        unsafe_secret_keys = {
+            "change-me-in-production",
+            "replace-with-at-least-32-random-characters",
+        }
+        if self.secret_key in unsafe_secret_keys or len(self.secret_key) < 32:
+            raise ValueError("生产环境 SECRET_KEY 必须是至少 32 位的随机字符串")
+        if self.database_url.startswith("sqlite"):
+            raise ValueError("生产环境必须使用 MySQL 等独立数据库，不能使用 SQLite")
+        return self
 
 
 @lru_cache
