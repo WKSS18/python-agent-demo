@@ -362,6 +362,24 @@ EMBEDDING_MODEL_PATH=/opt/fastembed-cache/fast-bge-small-zh-v1.5
 
 处理：增加 `RAG_VECTOR_SCORE_THRESHOLD=0.55`，在 Qdrant 查询和应用层同时过滤。低于阈值时不向模型提供笔记，也不在页面展示引用。实际样本中，不相关问题得分约 `0.41`，相关问题得分约 `0.75` 至 `0.78`。
 
+### 10.6 Chat 上传提示“OSS 尚未配置”
+
+现象：点击 Chat 回形针选择文件后，前端提示“OSS 尚未配置”。
+
+原因：最初的附件存储实现只支持阿里云 OSS；服务器没有配置 AccessKey、Bucket 时，`POST /uploads` 会返回 503。文档解析代码没有故障，请求是在进入解析接口前的附件持久化阶段失败。
+
+处理：增加可切换的附件存储策略。当前线上已配置私有阿里云 OSS，北京地域 Bucket 为 `wh-syyoss`，生产环境使用：
+
+```dotenv
+ATTACHMENT_STORAGE_BACKEND=oss
+OSS_ENDPOINT=https://oss-cn-beijing.aliyuncs.com
+OSS_BUCKET=wh-syyoss
+OSS_OBJECT_PREFIX=ai-agent-demo
+OSS_SIGNED_URL_EXPIRE_SECONDS=3600
+```
+
+`OSS_ACCESS_KEY_ID` 和 `OSS_ACCESS_KEY_SECRET` 只保存在服务器权限为 600 的 `.env.production`，不能提交到 Git、部署文档或前端代码。系统也保留 `auto/local` 模式：没有 OSS 时可回退到 Docker `upload_data` 持久卷，并使用 HMAC 过期签名 URL 访问。
+
 ## 11. 上线验收清单
 
 ```bash
@@ -382,6 +400,8 @@ df -h
 4. 确认回答能够引用当前用户笔记。
 5. 刷新页面后确认会话和 SPA 路由正常。
 6. 检查容器日志中没有持续报错或重启。
+7. 在 Chat 上传文档，确认出现“正在解析文档并准备分析”，随后收到流式回答。
+8. 在知识笔记页导入文档，等待 Worker 完成索引后再提问，确认只引用相关笔记。
 
 ## 12. 后续更新流程
 
@@ -427,7 +447,41 @@ docker compose down -v
 - 更大流量时将 MySQL、向量库和对象存储迁移到托管服务。
 - 多机部署时使用 Redis/API Gateway 实现统一限流，并增加负载均衡和滚动发布。
 
-## 13.1 文档导入与向量化链路
+## 13.1 Chat 附件上传与文档解析链路
+
+Chat 回形针用于“当前会话临时分析”，完整链路如下：
+
+```text
+浏览器选择文件
+  -> POST /uploads 上传到私有 OSS
+  -> 返回 object_key 和短期签名 URL
+  -> 用户点击发送
+  -> POST /agent/files/analyze 再提交原文件、提示词、session_id、object_key
+  -> FastAPI 校验并解析/OCR
+  -> 将提取文本和用户要求交给模型
+  -> 通过 SSE 返回 session / attachment / delta / done
+  -> 保存用户消息、模型回答和附件元数据
+```
+
+前端先上传 OSS，是为了让聊天历史能够长期保留附件；发送分析请求时仍携带原始文件，让 API 直接解析，避免再从 OSS 下载一次。后端同时检查 `object_key` 是否属于当前用户，防止跨用户引用附件。
+
+解析由 [file_parser.py](../app/file_parser.py) 完成，不是直接把所有原始文档交给大模型：
+
+| 文件格式 | 当前处理方式 |
+| --- | --- |
+| TXT、Markdown、CSV | 优先 UTF-8（含 BOM），兼容 GB18030 解码 |
+| PDF | `pypdf` 提取前 100 页的文本层；加密 PDF 拒绝处理 |
+| DOCX | 读取 OpenXML 的段落/表格文本节点 |
+| PNG、JPG、WEBP | Pillow 校正方向和压缩；Tesseract 执行中英文 OCR |
+| 图片语义理解 | 开启视觉模型时，同时把压缩后的图片交给视觉模型 |
+
+安全和资源限制：单文件最大 10 MB、图片最大 2500 万像素、视觉图片最长边压缩到 1568 像素、提取文本最多 60000 字符。解析结果会记录提取方式、字符数和是否截断，但完整文档正文不会重复写入聊天消息表。
+
+当前扫描版 PDF 没有文字层时可能提取不到正文，因为尚未实现“PDF 逐页转图片再 OCR”；复杂表格、公式和版式也可能丢失。这是现阶段文档解析能力的主要边界。
+
+Chat 附件默认不会进入 Qdrant。它只用于本次会话分析，避免临时合同、截图或敏感文件未经确认就污染长期知识库。
+
+## 13.2 知识笔记导入与向量化链路
 
 知识笔记页的“导入文档”支持 TXT、Markdown、CSV、PDF、DOCX 和常见图片，单文件最大 10 MB：
 
@@ -439,16 +493,14 @@ docker compose down -v
 6. FastEmbed 使用本地 `bge-small-zh-v1.5` 生成向量，写入 Qdrant。
 7. Chat 提问时生成查询向量，按用户 ID 过滤并应用 0.55 相关度阈值，只引用真实命中的笔记。
 
-Chat 回形针是另一条链路：附件会上传 OSS，并在服务端解析后交给模型做当前会话分析，但默认不会写入长期知识库。这样可以避免合同、截图等临时材料未经用户确认就污染知识库。
-
-附件存储使用 `ATTACHMENT_STORAGE_BACKEND=auto`：配置完整 OSS 凭证时使用私有 OSS；未配置时使用 Docker `upload_data` 持久卷。服务器本地附件同样通过 HMAC 过期签名 URL 访问，不直接暴露真实磁盘路径。首次创建数据卷后需确认容器用户可写：
+如果希望文档成为长期知识，必须在“知识笔记”页点击“导入文档”。附件存储支持 `oss`、`local` 和 `auto`：当前线上明确使用 `oss`；`auto` 会在凭证不完整时回退到 Docker `upload_data` 持久卷。本地附件同样通过 HMAC 过期签名 URL 访问，不直接暴露真实磁盘路径。首次创建本地数据卷后需确认容器用户可写：
 
 ```bash
 sudo docker compose --env-file .env.production exec -u root api \
   sh -c 'mkdir -p /data/uploads && chown -R 10001:10001 /data/uploads'
 ```
 
-## 13.2 日志与排障
+## 13.3 日志与排障
 
 API、模型调用、向量检索和索引 Worker 统一输出 JSON 到标准输出，关键字段包括 `request_id`、事件名、耗时、用户/会话/笔记 ID、模型 TTFT、Token 用量、检索命中数和最高分。日志不会记录密码、Token、完整问题或文档正文。
 
