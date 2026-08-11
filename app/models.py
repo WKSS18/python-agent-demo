@@ -85,3 +85,21 @@ class AgentMessage(Base):
             return None
         attachment = self.message_data.get("attachment")
         return attachment if isinstance(attachment, dict) else None
+
+
+class KnowledgeIndexJob(Base):
+    """Transactional outbox for eventually consistent vector indexing."""
+
+    __tablename__ = "knowledge_index_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    operation: Mapped[str] = mapped_column(String(20), index=True)
+    owner_id: Mapped[int] = mapped_column(Integer, index=True)
+    note_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

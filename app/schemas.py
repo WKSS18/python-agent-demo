@@ -42,13 +42,13 @@ class Token(BaseModel):
 
 class NoteCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
-    content: str = Field(min_length=1)
+    content: str = Field(min_length=1, max_length=50_000)
 
 
 class NoteUpdate(BaseModel):
     """笔记部分更新 DTO；未传字段通过 ``exclude_unset`` 保持原值。"""
     title: str | None = Field(default=None, min_length=1, max_length=200)
-    content: str | None = Field(default=None, min_length=1)
+    content: str | None = Field(default=None, min_length=1, max_length=50_000)
 
 
 class NoteRead(BaseModel):
@@ -63,8 +63,20 @@ class NoteRead(BaseModel):
 
 
 class AgentChatRequest(BaseModel):
-    question: str = Field(min_length=1)
+    question: str = Field(min_length=1, max_length=10_000)
     session_id: int | None = None
+
+
+class KnowledgeIndexTaskRead(BaseModel):
+    id: int
+    operation: str
+    status: str
+    attempts: int
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AgentChatResponse(BaseModel):

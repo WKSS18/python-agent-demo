@@ -26,6 +26,16 @@ services:
         condition: service_healthy
     restart: "no"
 
+  qdrant:
+    image: qdrant/qdrant:v1.18.3
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
+    volumes:
+      - qdrant_data:/qdrant/storage
+
   api:
     build: .
     restart: unless-stopped
@@ -39,6 +49,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      qdrant:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
       interval: 15s
@@ -46,5 +58,20 @@ services:
       retries: 5
       start_period: 20s
 
+  knowledge-worker:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - ${ENV_FILE:-.env.production}
+    command: ["python", "-m", "app.knowledge_worker"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_started
+
 volumes:
   mysql_data:
+  qdrant_data:

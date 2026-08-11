@@ -20,6 +20,7 @@ from app.database import SessionLocal
 from app.file_parser import ParsedFile
 from app.security import hash_password, verify_password
 from app.storage import OssStorage
+from app.vector_store import VectorStore
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,9 @@ class NoteService(BaseService):
             title=data.title,
             content=data.content,
         )
+        if get_settings().vector_store_enabled:
+            self.db.flush()
+            crud.add_index_job(self.db, "upsert", owner_id, note_id=note.id)
         self._commit()
         self.db.refresh(note)
         return note
@@ -100,14 +104,39 @@ class NoteService(BaseService):
         for key, value in data.model_dump(exclude_unset=True).items():
             setattr(note, key, value)
 
+        if get_settings().vector_store_enabled:
+            crud.add_index_job(self.db, "upsert", owner_id, note_id=note.id)
         self._commit()
         self.db.refresh(note)
         return note
 
     def delete(self, owner_id: int, note_id: int) -> None:
         note = self.get(owner_id, note_id)
+        if get_settings().vector_store_enabled:
+            crud.add_index_job(self.db, "delete", owner_id, note_id=note_id)
         crud.delete_note(self.db, note)
         self._commit()
+
+
+class KnowledgeService(BaseService):
+    """Vector index operations used for initial import and recovery."""
+
+    def enqueue_reindex(self, owner_id: int) -> models.KnowledgeIndexJob:
+        if not get_settings().vector_store_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="向量知识库当前未启用。",
+            )
+        job = crud.add_index_job(self.db, "reindex", owner_id)
+        self._commit()
+        self.db.refresh(job)
+        return job
+
+    def get_task(self, owner_id: int, task_id: int) -> models.KnowledgeIndexJob:
+        job = crud.get_owned_index_job(self.db, task_id, owner_id)
+        if not job:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="索引任务不存在。")
+        return job
 
 
 class AgentService(BaseService):
@@ -195,6 +224,8 @@ class AgentService(BaseService):
             content=data.content,
         )
         self.db.flush()
+        if get_settings().vector_store_enabled:
+            crud.add_index_job(self.db, "upsert", owner_id, note_id=note.id)
         message.message_data = {
             **form_data,
             "status": "completed",
@@ -398,11 +429,51 @@ class AgentService(BaseService):
     def _retrieve_note_snapshots(self, owner_id: int, question: str) -> list[schemas.NoteRead]:
         """用混合 RAG 召回当前用户笔记；无命中时让模型用自身知识回答。"""
         all_notes = crud.list_notes(self.db, owner_id=owner_id)
-        retrieved_notes = rag.retrieve_notes(question, all_notes, limit=5)
-        selected_notes = [item.note for item in retrieved_notes]
+        settings = get_settings()
+        snapshots: list[schemas.NoteRead]
+        if settings.vector_store_enabled:
+            try:
+                hits = VectorStore().search(owner_id, question, settings.rag_candidate_limit)
+                note_ids = list(dict.fromkeys(hit.note_id for hit in hits))
+                selected_notes = crud.list_owned_notes_by_ids(self.db, owner_id, note_ids)
+                best_chunks: dict[int, str] = {}
+                vector_scores: dict[int, float] = {}
+                for hit in hits:
+                    best_chunks.setdefault(hit.note_id, hit.chunk)
+                    vector_scores.setdefault(hit.note_id, hit.score)
+                selected_notes.sort(
+                    key=lambda note: (
+                        vector_scores.get(note.id, 0.0) * 0.75
+                        + rag.keyword_score(question, f"{note.title} {best_chunks.get(note.id, '')}") * 0.25
+                    ),
+                    reverse=True,
+                )
+                selected_notes = selected_notes[:settings.rag_top_k]
+                snapshots = [
+                    schemas.NoteRead.model_validate(note).model_copy(
+                        update={"content": best_chunks.get(note.id, note.content[:500])},
+                    )
+                    for note in selected_notes
+                ]
+            except Exception:
+                logger.exception("Vector search failed; falling back to local hybrid retrieval")
+                retrieved_notes = rag.retrieve_notes(question, all_notes, limit=settings.rag_top_k)
+                snapshots = [
+                    schemas.NoteRead.model_validate(item.note).model_copy(
+                        update={"content": item.matched_chunk},
+                    )
+                    for item in retrieved_notes
+                ]
+        else:
+            retrieved_notes = rag.retrieve_notes(question, all_notes, limit=settings.rag_top_k)
+            snapshots = [
+                schemas.NoteRead.model_validate(item.note).model_copy(
+                    update={"content": item.matched_chunk},
+                )
+                for item in retrieved_notes
+            ]
 
         # 转成 DTO 后结束读事务，避免慢速模型调用长期占用数据库连接和事务。
-        snapshots = [schemas.NoteRead.model_validate(note) for note in selected_notes]
         self.db.rollback()
         return snapshots
 

@@ -8,6 +8,8 @@
 .venv/
 __pycache__/
 *.py[cod]
+.cache/
+*.log
 
 # macOS 元数据。
 .DS_Store

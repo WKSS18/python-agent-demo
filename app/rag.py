@@ -119,3 +119,8 @@ def _keyword_overlap(query_tokens: list[str], document_tokens: list[str]) -> flo
     query_set = set(query_tokens)
     document_set = set(document_tokens)
     return len(query_set & document_set) / len(query_set)
+
+
+def keyword_score(query: str, document: str) -> float:
+    """Public lexical score used to rerank vector candidates."""
+    return _keyword_overlap(_tokenize(query), _tokenize(document))

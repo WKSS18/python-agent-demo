@@ -54,3 +54,12 @@ def check_database_connection() -> None:
     """执行轻量查询，供就绪探针判断数据库是否可用。"""
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
+
+
+def check_dependencies() -> None:
+    """Check the relational database and the enabled vector database."""
+    check_database_connection()
+    if settings.vector_store_enabled:
+        from app.vector_store import VectorStore
+
+        VectorStore().check()

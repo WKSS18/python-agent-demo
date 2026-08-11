@@ -11,7 +11,7 @@ from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
 import pytesseract
-from fastapi import HTTPException, status
+from fastapi import HTTPException, UploadFile, status
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pypdf import PdfReader
 
@@ -22,6 +22,24 @@ MAX_EXTRACTED_CHARS = 60_000
 MAX_IMAGE_PIXELS = 25_000_000
 MAX_VISION_LONG_EDGE = 1_568
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".csv", ".pdf", ".docx", ".png", ".jpg", ".jpeg", ".webp"}
+
+
+async def read_upload_limited(file: UploadFile) -> bytes:
+    """Stream an upload into memory with an early hard limit."""
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while chunk := await file.read(1024 * 1024):
+            total += len(chunk)
+            if total > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail="文件不能超过 10 MB。",
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        await file.close()
 
 
 @dataclass(frozen=True)

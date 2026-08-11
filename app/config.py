@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     app_env: str = "local"
     secret_key: str = "change-me-in-production"
     access_token_expire_minutes: int = 120
+    cors_allowed_origins: str = ""
     database_url: str = "sqlite:///./ai_agent_demo.db"
     db_pool_size: int = 10
     db_max_overflow: int = 20
@@ -36,6 +37,18 @@ class Settings(BaseSettings):
     anthropic_default_haiku_model: str = ""
     claude_code_subagent_model: str = ""
     api_timeout_ms: int = 600_000
+    # 知识库向量检索：本地可关闭，生产环境通过 Qdrant 持久化分块向量。
+    vector_store_enabled: bool = False
+    qdrant_url: str = "http://127.0.0.1:6333"
+    qdrant_api_key: str = ""
+    qdrant_collection: str = "note_chunks"
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    embedding_cache_dir: str = ".cache/fastembed"
+    vector_request_timeout_seconds: float = 10.0
+    rag_top_k: int = 5
+    rag_candidate_limit: int = 12
+    rate_limit_enabled: bool = True
+    metrics_enabled: bool = True
     # OSS 配置：长期密钥仅由后端读取，浏览器只接触短期签名 URL。
     oss_access_key_id: str = ""
     oss_access_key_secret: str = ""
@@ -55,6 +68,10 @@ class Settings(BaseSettings):
         """生产环境启用更严格的启动检查。"""
         return self.app_env.lower() in {"production", "prod"}
 
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
+
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
         """尽早拒绝危险的生产默认值，避免服务带着弱配置启动。"""
@@ -68,6 +85,14 @@ class Settings(BaseSettings):
             raise ValueError("生产环境 SECRET_KEY 必须是至少 32 位的随机字符串")
         if self.database_url.startswith("sqlite"):
             raise ValueError("生产环境必须使用 MySQL 等独立数据库，不能使用 SQLite")
+        if not self.anthropic_auth_token:
+            raise ValueError("生产环境必须配置 ANTHROPIC_AUTH_TOKEN")
+        if self.vector_store_enabled and not self.qdrant_url:
+            raise ValueError("启用向量检索时必须配置 QDRANT_URL")
+        if self.vector_store_enabled and not self.qdrant_api_key:
+            raise ValueError("生产环境启用向量检索时必须配置 QDRANT_API_KEY")
+        if "*" in self.cors_origins:
+            raise ValueError("生产环境 CORS_ALLOWED_ORIGINS 禁止使用通配符 *")
         return self
 
 

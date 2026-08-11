@@ -1,495 +1,348 @@
-# Fieldnote AI Agent 后端
+# Fieldnote AI Agent
 
-基于 FastAPI 的个人知识库 Agent 后端。项目不是单纯调用一次大模型的 Demo，而是把认证、用户数据隔离、笔记 CRUD、会话持久化、RAG 检索、SSE 流式输出、结构化业务表单、文件解析、视觉分析和阿里云 OSS 串成一条完整业务链路。
+一个面向个人知识管理场景的全栈 AI Agent 项目。后端使用 FastAPI、LangGraph、MySQL、Qdrant、FastEmbed 和 Anthropic Messages 兼容模型服务，前端使用 React、TypeScript、Vite 与 Ant Design X。
 
-配套前端仓库位于同级目录 `../agent-frontfond`。
+项目不只是一次模型调用 Demo：它覆盖认证、用户数据隔离、知识笔记 CRUD、向量化知识库、RAG、会话记忆、SSE 流式输出、文件/OCR/图片分析、结构化表单、OSS 私有附件以及容器化生产部署。
 
-## 1. 项目能力
+配套前端位于 `../agent-frontfond`。
 
-- 邮箱注册、bcrypt 密码哈希、JWT Bearer 鉴权。
-- 按用户隔离的知识笔记增删改查与关键字搜索。
-- Agent 会话和消息持久化，刷新页面可以恢复历史。
-- 检索当前用户笔记后调用 Anthropic Messages 兼容模型。
-- 没有命中笔记时使用模型自身知识回答，不伪造引用。
-- 通过 SSE 增量返回模型文本、引用来源、附件和结构化表单。
-- Markdown 回答、引用快照及表单完成状态持久化。
-- TXT、Markdown、CSV、PDF、DOCX 和常见图片解析。
-- 图片预处理、Tesseract OCR、可选视觉模型分析。
-- 私有 OSS 对象上传、用户目录隔离、短期签名 URL 和孤儿文件删除。
-- Pydantic 统一响应、全局异常处理和 Swagger API 文档。
-- SQLAlchemy 2 ORM、Service 事务边界和 Alembic 数据库迁移。
-- 未配置模型密钥时提供流式 Mock，方便本地调试完整链路。
+## 1. 项目亮点
+
+- JWT 登录认证；密码只保存 bcrypt 哈希。
+- Service 层统一处理权限、幂等、事务和跨模块流程。
+- 笔记按 500 字符、80 字符重叠窗口切块。
+- FastEmbed 使用 `BAAI/bge-small-zh-v1.5` 生成中文语义向量。
+- Qdrant 持久化分块向量，并用 `owner_id` payload filter 保证多租户隔离。
+- Qdrant 为 `owner_id`、`note_id` 建立 payload index，避免数据量增长后过滤退化为全量扫描。
+- 笔记新增、更新、删除后同步维护向量索引；支持一键全量重建。
+- 笔记事务与索引任务写入同一个 MySQL 事务；独立 `knowledge-worker` 消费 Outbox，失败指数退避并最多重试 6 次。
+- 全量 reindex 改为异步任务，接口立即返回任务 ID，可查询 pending/processing/completed/failed 状态。
+- Qdrant 暂时不可用时自动回退到本地关键词 + 哈希向量混合检索。
+- 只将真实召回的笔记传给模型，引用来源由服务端产生并保存快照。
+- LangGraph 显式编排“检索知识 → 组织上下文 → 模型生成”流程。
+- LangGraph 模型节点带指数退避重试；向量候选按 75% 语义分 + 25% 关键词分混合重排。
+- SSE 逐段返回 `session/sources/delta/form/done/error` 事件。
+- 模型调用期间不长期占用数据库连接和事务。
+- 支持 PDF、DOCX、TXT、Markdown、图片 OCR 与视觉模型分析。
+- OSS 使用用户目录隔离和短期签名 URL，长期密钥不进入浏览器。
+- Docker Compose 提供 MySQL、Qdrant、迁移任务和多 worker API。
+- `/health` 用于存活检查，`/ready` 同时检查 MySQL 与已启用的 Qdrant。
+- 每个响应携带 `X-Request-ID`，提供 Prometheus `/metrics`、路由级基础限流和请求耗时日志。
+- 笔记、问题和上传文件均有服务端硬限制，上传采用分块读取，在超过 10 MB 时提前终止。
 
 ## 2. 技术栈
 
-| 分类 | 技术 | 项目中的作用 |
+| 分类 | 技术 | 用途 |
 | --- | --- | --- |
-| Web | FastAPI、Uvicorn | API、依赖注入、Swagger、SSE 响应 |
-| 数据合同 | Pydantic v2 | 请求校验、响应裁剪、时间序列化 |
-| 数据库 | SQLAlchemy 2、Alembic | ORM、Session、事务、结构迁移 |
-| 认证 | Passlib、bcrypt、python-jose | 密码哈希、JWT 签发和校验 |
-| Agent | LangGraph | 显式编排“检索 -> 生成”状态图 |
-| 模型 | Anthropic Python SDK | 调用 Anthropic Messages 兼容接口 |
-| 文件 | PyPDF、Pillow、pytesseract | PDF 提取、图片处理和 OCR |
-| 存储 | oss2 | 阿里云 OSS 私有对象和签名 URL |
-| 数据库 | SQLite / MySQL 8 | SQLite 用于本地开发；Compose 准生产环境使用 MySQL |
+| Web | FastAPI、Uvicorn | REST API、依赖注入、SSE、Swagger |
+| 数据合同 | Pydantic v2 | 输入校验、响应裁剪、配置校验 |
+| 关系数据库 | SQLAlchemy 2、Alembic、MySQL/SQLite | 用户、笔记、会话、消息和事务 |
+| 向量知识库 | FastEmbed、Qdrant | 分块、Embedding、持久化和语义召回 |
+| Agent | LangGraph、Anthropic SDK | 状态图编排和模型协议适配 |
+| 文件能力 | pypdf、python-docx、Pillow、Tesseract | 文档解析、OCR 和图片分析 |
+| 对象存储 | 阿里云 OSS | 私有附件、签名预览、归属校验 |
+| 部署 | Docker、Compose、Nginx | 服务编排、迁移、健康检查、HTTPS/SSE 代理 |
+| 前端 | React、TypeScript、Vite、Ant Design X | 聊天、笔记、引用、附件和表单 UI |
 
-## 3. 总体架构
+## 3. 架构
 
 ```text
-React Browser
-  │  JSON / multipart / POST SSE
-  ▼
-Vite Proxy 或 Nginx
-  ▼
+Browser / React
+       |
+       | REST + JWT + SSE
+       v
 FastAPI Route
-  │  参数接收、Depends 鉴权、响应协议
-  ▼
-Service
-  │  权限、事务、幂等、业务编排
-  ├── CRUD ──> SQLAlchemy ──> SQLite / MySQL
-  ├── Agent ──> LangGraph ──> Anthropic-compatible API
-  ├── File Parser ──> PDF / DOCX / OCR / Image preprocess
-  └── Storage ──> Aliyun OSS
+       |
+       v
+Service: 权限、事务、幂等、业务编排
+  |          |             |             |
+  v          v             v             v
+MySQL     LangGraph     Qdrant          OSS
+业务数据   Agent 状态图   分块向量         私有附件
+                         ^
+                         |
+                    FastEmbed
 ```
 
-依赖方向保持为：
+后端分层：
 
 ```text
-main(Route) -> services -> crud / agent / storage
-                         -> schemas / models
+app/main.py          HTTP 路由、依赖注入、SSE 响应
+app/schemas.py       Pydantic 请求/响应合同
+app/services.py      权限、事务、索引同步、应用流程
+app/crud.py          SQLAlchemy 查询与对象增删
+app/models.py        关系数据模型
+app/agent.py         LangGraph 与模型调用
+app/rag.py           本地混合检索降级实现
+app/vector_store.py  切块、FastEmbed、Qdrant 适配
+app/file_parser.py   PDF/DOCX/文本/OCR 解析
+app/storage.py       OSS 私有对象与签名 URL
 ```
 
-核心原则：Route 不写业务，CRUD 不决定提交事务，Agent 不依赖 HTTP 和数据库，OSS SDK 不泄漏到业务代码。
+## 4. 知识库与 RAG 流程
 
-## 4. 目录与模块职责
+### 4.1 写入流程
 
 ```text
-app/
-├── main.py          # FastAPI 入口、路由、依赖组装和 SSE Response
-├── config.py        # .env 类型安全配置和单例缓存
-├── database.py      # Engine、SessionLocal、Base、请求级 Session
-├── models.py        # SQLAlchemy ORM 表和关系
-├── schemas.py       # Pydantic 请求/响应 DTO
-├── crud.py          # 纯数据访问，不 commit/rollback
-├── services.py      # 权限、事务、幂等、会话和流式业务编排
-├── agent.py         # RAG 状态、提示词、LangGraph 和模型适配
-├── file_parser.py   # 文件校验、抽取、OCR、图片预处理
-├── storage.py       # OSS 上传、签名、删除、归属校验
-├── chat_forms.py    # 允许在聊天中执行的结构化动作白名单
-├── security.py      # bcrypt 和 JWT
-├── deps.py          # 当前用户鉴权依赖
-└── responses.py     # 统一响应与全局异常处理
-migrations/          # Alembic 迁移脚本
-docs/                # 扩展面试资料
-dev.sh               # 本地初始化、迁移和启动脚本
+创建/更新笔记
+  -> MySQL 提交业务数据
+  -> 标题 + 正文切块（500，overlap 80）
+  -> FastEmbed 生成中文语义向量
+  -> 同一 MySQL 事务写入 knowledge_index_jobs Outbox
+  -> knowledge-worker 领取任务
+  -> FastEmbed + Qdrant upsert
+  -> payload 保存 owner_id、note_id、chunk_index、title、chunk
 ```
 
-阅读代码推荐顺序：`main.py -> schemas.py -> services.py -> crud.py/models.py -> agent.py -> file_parser.py/storage.py`。
+删除笔记时在同一事务写入 delete 任务，Worker 再按 `owner_id + note_id` 删除对应向量。MySQL 是真实数据源；Worker 崩溃后会回收超过 10 分钟的 processing 租约，任务失败采用指数退避，连续 6 次失败后标记为 failed。可调用 `POST /knowledge/reindex` 异步重建当前用户索引。
 
-## 5. 快速启动
+### 4.2 查询流程
 
-### 5.1 环境要求
+```text
+用户问题
+  -> FastEmbed 生成 query vector
+  -> Qdrant 按 owner_id 过滤并召回候选分块
+  -> 语义分 75% + 关键词分 25% 混合重排
+  -> 按 note_id 去重并取 Top-K
+  -> 再从 MySQL 按 owner_id 查询笔记
+  -> 仅将每篇笔记的最佳命中分块放入 RAG context
+  -> 模型流式回答
+  -> 保存答案与引用快照
+```
 
-- Python 3.11 或更高版本。
-- 图片 OCR 需要系统安装 Tesseract；中文识别建议安装 `chi_sim` 语言包。
-- 文件上传需要可用的阿里云 OSS Bucket。
-- 真实问答需要兼容 Anthropic Messages API 的模型服务。
+安全边界有两层：Qdrant payload filter 限制当前用户，MySQL 查询再次校验 `owner_id`。即使向量 payload 配错，也不会将其他用户笔记返回给模型。模型系统提示还明确把笔记内容视为不可信数据，降低知识库文本中提示注入指令的影响。
 
-### 5.2 一键启动
+### 4.3 降级策略
+
+本地开发默认 `VECTOR_STORE_ENABLED=false`，使用关键词重叠 + 本地哈希向量检索，方便零依赖启动。生产默认启用 Qdrant。Qdrant 请求失败时会记录完整服务端日志并回退本地检索，聊天功能仍可用，但召回质量与性能会下降。
+
+## 5. Agent 编排是否完整
+
+项目已经包含可运行的 LangGraph 编排，不是只安装了依赖：
+
+```text
+START
+  -> retrieve_notes：调用注入的检索器，获取当前用户真实笔记
+  -> generate_answer：拼接会话记忆、问题和知识上下文，调用模型
+  -> END
+```
+
+同步 `/agent/chat` 走完整 LangGraph 状态图。前端使用的 `/agent/chat/stream` 为了直接转发 token 增量，复用相同的检索函数与生成函数，但由 Service 控制 SSE 生命周期和消息持久化。结构化“创建笔记”意图会进入受控表单分支，不执行模型生成的任意工具调用。
+
+当前编排属于确定性工作流，而不是开放式自治 Agent。生产扩展可以增加意图路由、工具执行、审核节点、重试、checkpoint、人工确认和任务队列；面试时不要把这些后续方向说成已经实现。
+
+## 6. 本地启动
+
+要求 Python 3.12+、Node.js 20+。仅聊天和 CRUD 可以不启动 Qdrant。
+
+后端：
 
 ```bash
 cd python-agent-demo
-chmod +x dev.sh
-./dev.sh
-```
-
-脚本会创建虚拟环境、安装依赖、创建本地配置、执行迁移并启动开发服务器。
-
-### 5.3 手动启动
-
-```bash
-cd python-agent-demo
-python3 -m venv .venv
-source .venv/bin/activate
+python -m venv .venv
+# Linux/macOS: source .venv/bin/activate
+# Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+cp .env.example .env
 alembic upgrade head
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-- 健康检查：`http://127.0.0.1:8000/health`
-- Swagger：`http://127.0.0.1:8000/docs`
-- OpenAPI JSON：`http://127.0.0.1:8000/openapi.json`
-
-## 6. 环境变量
-
-真实配置写入本地 `.env`，不要提交密钥。示例：
-
-```dotenv
-# 应用和鉴权
-APP_NAME=Fieldnote AI Agent
-APP_ENV=local
-SECRET_KEY=请替换为随机长字符串
-ACCESS_TOKEN_EXPIRE_MINUTES=120
-
-# 默认可使用 SQLite；面试演示无需额外安装数据库
-DATABASE_URL=sqlite:///./ai_agent_demo.db
-
-# Anthropic Messages 兼容模型
-ANTHROPIC_AUTH_TOKEN=你的模型密钥
-ANTHROPIC_BASE_URL=https://api.anthropic.com
-ANTHROPIC_MODEL=你的文本模型
-ANTHROPIC_VISION_MODEL=你的视觉模型
-ANTHROPIC_VISION_ENABLED=true
-API_TIMEOUT_MS=600000
-
-# 阿里云 OSS
-OSS_ACCESS_KEY_ID=你的AccessKeyId
-OSS_ACCESS_KEY_SECRET=你的AccessKeySecret
-OSS_ENDPOINT=https://oss-cn-beijing.aliyuncs.com
-OSS_BUCKET=你的Bucket名称
-OSS_OBJECT_PREFIX=ai-agent-demo
-OSS_SIGNED_URL_EXPIRE_SECONDS=3600
-```
-
-注意：
-
-- `ANTHROPIC_VISION_MODEL` 为空时复用 `ANTHROPIC_MODEL`。
-- 兼容服务若不接受 Anthropic `image` 内容块，应设置 `ANTHROPIC_VISION_ENABLED=false`。
-- `VITE_` 前缀变量会进入浏览器构建产物，绝不能把模型或 OSS 长期密钥放到前端。
-- 已经在聊天或截图中暴露过的 AccessKey/Token 应立即在云平台轮换。
-
-### 6.1 MySQL
-
-应用使用 SQLAlchemy，替换连接 URL 即可切换 MySQL：
-
-```dotenv
-DATABASE_URL=mysql+pymysql://app_user:URL编码后的密码@127.0.0.1:3306/ai_agent_demo?charset=utf8mb4
-```
-
-切换后仍需执行：
+前端：
 
 ```bash
-alembic upgrade head
+cd ../agent-frontfond
+npm install
+npm run dev
 ```
 
-本地开发默认使用 SQLite；准生产环境必须使用 MySQL。`APP_ENV=production`
-时应用会拒绝 SQLite、示例密钥和长度不足 32 位的 `SECRET_KEY`。
+- 前端：http://127.0.0.1:5173
+- API：http://127.0.0.1:8000
+- Swagger：http://127.0.0.1:8000/docs
+- 健康检查：http://127.0.0.1:8000/health
 
-连接池可通过以下变量调整：
+如果本地也要验证真实向量库，启动 Qdrant，将 `.env` 中 `VECTOR_STORE_ENABLED=true`，同时启动 `python -m app.knowledge_worker`，再调用 `POST /knowledge/reindex`。
 
-```dotenv
-DB_POOL_SIZE=10
-DB_MAX_OVERFLOW=20
-DB_POOL_TIMEOUT_SECONDS=30
-DB_POOL_RECYCLE_SECONDS=1800
+## 7. 关键配置
+
+模型服务使用 Anthropic Messages 兼容协议：
+
+```env
+ANTHROPIC_AUTH_TOKEN=replace-me
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+ANTHROPIC_MODEL=deepseek-v4-flash
+ANTHROPIC_VISION_MODEL=deepseek-v4-flash
+API_TIMEOUT_MS=600000
 ```
 
-MySQL 连接默认启用连接存活检查和定期回收，避免数据库关闭空闲连接后应用继续复用
-失效连接。
+向量知识库：
 
-### 6.2 Docker Compose 准生产部署
+```env
+VECTOR_STORE_ENABLED=true
+QDRANT_URL=http://qdrant:6333
+QDRANT_API_KEY=replace-with-a-long-random-key
+QDRANT_COLLECTION=note_chunks
+EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+EMBEDDING_CACHE_DIR=/opt/fastembed-cache
+RAG_TOP_K=5
+RAG_CANDIDATE_LIMIT=12
+RATE_LIMIT_ENABLED=true
+METRICS_ENABLED=true
+```
 
-仓库提供 API、MySQL 8 和独立迁移任务。首次启动：
+更换 `EMBEDDING_MODEL` 后向量维度或语义空间可能变化，应更换 collection 名或删除旧 collection，再执行全量 reindex。
+
+## 8. 生产部署检查与步骤
+
+当前 Compose 是单机生产基线，适合面试演示、小流量服务或进一步接入云基础设施。它已具备：
+
+- MySQL 8.4 持久卷和健康检查。
+- 独立 `migrate` 一次性任务，成功后才启动 API。
+- Qdrant 固定版本和持久卷，仅绑定宿主机回环地址 `127.0.0.1:6333`，便于本机备份且不暴露公网。
+- 独立 `knowledge-worker` 消费向量 Outbox，不在 API 请求中执行全量 reindex。
+- API 非 root 用户、多 worker、就绪检查、自动重启。
+- API 仅绑定宿主机 `127.0.0.1:8000`，必须由 Nginx/云负载均衡对外提供 HTTPS。
+- 镜像构建时预下载 embedding 模型，避免首请求下载。
+- 生产配置启动校验：弱 `SECRET_KEY`、SQLite、空模型密钥、空 Qdrant 密钥会拒绝启动。
+
+部署命令：
 
 ```bash
 cp .env.production.example .env.production
-# 编辑 .env.production，替换所有示例密码、SECRET_KEY、模型和 OSS 配置。
-docker compose up -d --build
-docker compose ps
+# 修改所有 replace-with-* 和第三方密钥
+docker compose --env-file .env.production config
+docker compose --env-file .env.production build
+docker compose --env-file .env.production up -d
+docker compose --env-file .env.production ps
 curl http://127.0.0.1:8000/ready
 ```
 
-生成随机 JWT 密钥：
+首次上线或已有笔记迁移到 Qdrant 后，登录获取 JWT，再调用：
 
 ```bash
-openssl rand -hex 32
+curl -X POST https://api.example.com/knowledge/reindex \
+  -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
-注意：
+接口返回任务 ID，随后查询：
 
-- `MYSQL_PASSWORD` 如果包含 URL 特殊字符，写入 `DATABASE_URL` 时必须进行 URL 编码。
-- MySQL 数据保存在具名卷 `mysql_data`，重建 API 容器不会删除数据库。
-- `migrate` 服务在 API 启动前执行一次 `alembic upgrade head`。
-- `/health` 是进程存活探针，`/ready` 会执行 `SELECT 1` 检查数据库。
-- Compose 是单机准生产方案；正式公网环境仍应在前面配置 HTTPS 反向代理、备份、
-  日志收集和监控告警。
-- 如果需要信任反向代理头，只允许明确的代理地址或网段，不要信任任意来源。
-
-## 7. 数据模型
-
-```text
-User 1 ─── N Note
-User 1 ─── N AgentSession
-AgentSession 1 ─── N AgentMessage
+```bash
+curl https://api.example.com/knowledge/tasks/TASK_ID \
+  -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
-| 表 | 关键字段 | 设计目的 |
+Nginx 示例位于 `deploy/nginx.conf.example`，其中关闭了 `proxy_buffering` 并将读取超时设为 650 秒，保证 SSE 不被缓存成一次性响应。
+
+推荐同源部署：Nginx 的 `/` 提供前端静态文件，`/api/` 反向代理后端。若前后端必须分域，将前端完整 Origin 写入 `CORS_ALLOWED_ORIGINS`（多个值用英文逗号分隔），并将前端 `VITE_API_BASE_URL` 指向 API 域名；不要使用 `*`。
+
+### 上线前必须完成
+
+- 使用密码管理器生成至少 32 位随机 `SECRET_KEY`、MySQL 密码和 Qdrant API Key。
+- 对已在聊天、截图或 Git 中出现过的模型/OSS 密钥立即轮换。
+- 为域名配置 HTTPS，不直接公开 Uvicorn、MySQL 或 Qdrant 端口。
+- 配置 MySQL 与 Qdrant 数据卷备份，并实际演练恢复。
+- 限制服务器安全组，只开放 80/443 和必要的运维入口。
+- 接入集中日志、错误告警、磁盘/内存监控和请求追踪。
+- 根据 CPU/内存压测结果设置 `WEB_CONCURRENCY`；embedding 是 CPU 密集型，worker 越多内存占用越高。
+- 应用已为注册、登录、上传、模型调用和 reindex 提供基础限流；多机部署仍需 Redis 或 API Gateway 统一限流与成本配额。
+- 定时执行 `deploy/backup.ps1`，并将产物同步到异地对象存储；备份必须配套恢复演练。
+- 多机部署时将 MySQL、Qdrant、OSS 迁移为高可用托管或集群方案。
+
+单机 Compose 仍不是完整高可用架构：它没有自动备份、跨机容灾、WAF、限流服务、集中可观测性和滚动发布控制。这些需要由服务器或云平台补充。
+
+## 9. API 概览
+
+| 方法 | 路径 | 功能 |
 | --- | --- | --- |
-| `users` | `email`、`hashed_password` | 邮箱唯一；只保存密码哈希 |
-| `notes` | `owner_id`、`title`、`content` | 用户知识库与数据隔离 |
-| `agent_sessions` | `owner_id`、`title` | 保存连续对话容器 |
-| `agent_messages` | `role`、`content`、`message_type`、`message_data` | 同时支持文本、表单、附件和引用快照 |
-
-`message_data` 是 JSON 扩展字段：
-
-- 普通回答保存 `used_notes` 快照。
-- 用户附件消息保存文件元数据与 `object_key`。
-- 表单消息保存 `kind/status/fields/result`。
-
-引用使用“回答生成时快照”，而不是打开历史时重新查询当前 Note。这样笔记后来被修改或删除，旧回答仍能说明当时真正使用了什么上下文。
-
-## 8. 认证与权限隔离
-
-注册链路：
-
-```text
-UserCreate 校验 -> email 查重 -> bcrypt hash -> INSERT -> commit -> UserRead
-```
-
-登录链路：
-
-```text
-OAuth2 表单 -> bcrypt verify -> JWT(sub=user_id, exp=UTC time) -> Bearer Token
-```
-
-受保护接口通过 `Depends(get_current_user)`：
-
-1. 读取 Authorization Bearer Token。
-2. 校验 JWT 签名和过期时间。
-3. 根据 `sub` 查询当前用户。
-4. Service 再校验 Note、Session、Message 或 OSS 对象是否属于该用户。
-
-这种双层校验避免“只要知道资源 ID 就能访问”的水平越权问题。
-
-## 9. 普通聊天与 RAG
-
-### 9.1 当前检索策略
-
-当前实现使用数据库 `LIKE` 对标题和正文做关键字匹配，最多取 5 条真实命中笔记。它适合讲清楚 RAG 主链路，但不是语义向量检索。
-
-```text
-question
-  -> owner_id 范围内检索 Notes
-  -> 命中：把 Note DTO 拼成上下文
-  -> 未命中：明确告诉模型没有笔记上下文
-  -> 模型生成
-  -> 保存完整答案和引用快照
-```
-
-未命中时不会拿“最近笔记”冒充引用，前端也不会显示虚假的“引用 1 条笔记”。
-
-### 9.2 LangGraph
-
-同步接口用两个节点表达 Agent：
-
-```text
-retrieve_notes -> generate_answer -> END
-```
-
-当前图很小，但显式状态图便于继续增加：向量召回、rerank、工具调用、人工审核、重试或条件分支。
-
-## 10. SSE 流式协议
-
-接口：`POST /agent/chat/stream`
-
-选择 SSE 的原因：该场景主要是服务端单向增量推送，协议比 WebSocket 简单；使用 `fetch` 而不是原生 `EventSource`，因为请求需要 POST JSON 和 Authorization Header。
-
-| 事件 | 数据 | 前端动作 |
-| --- | --- | --- |
-| `session` | `session_id` | 保存当前会话 |
-| `sources` | `used_notes` | 展示真实引用 |
-| `attachment` | 附件元数据 | 更新 OSS 预览和提取信息 |
-| `delta` | 文本片段 | 追加 Markdown 内容 |
-| `form` | 受控表单描述 | 渲染业务组件 |
-| `done` | `message_id` | 用数据库 ID 替换临时 ID |
-| `error` | `code/message` | 展示脱敏错误 |
-
-模型调用可能耗时数秒，因此事务被拆成：
-
-1. 短事务保存用户消息并提交。
-2. 不持有数据库事务，流式调用模型。
-3. 短事务保存完整助手消息和引用快照。
-
-这能避免慢模型调用长期占用连接或持有数据库锁。
-
-## 11. 文件与图片分析
-
-### 11.1 前后端调用顺序
-
-```text
-选择文件
-  -> POST /uploads 上传私有 OSS
-  -> 返回 object_key + 临时签名 URL
-  -> POST /agent/files/analyze
-  -> 解析/OCR/图片预处理
-  -> SSE 返回 attachment + delta + done
-  -> 保存用户附件消息和助手分析
-```
-
-选中文件后立即上传，而不是等点击发送才上传。用户移除未发送附件时，前端调用 `DELETE /uploads` 清理孤儿对象。
-
-### 11.2 文件限制
-
-- 单文件最大 10 MB。
-- 支持 `txt/md/csv/pdf/docx/png/jpg/jpeg/webp`。
-- 文本尝试 UTF-8 BOM 和 GB18030。
-- PDF 最多读取前 100 页；加密 PDF 明确拒绝。
-- DOCX 直接解析 OpenXML 正文和表格文字。
-- 图片限制像素数，EXIF 纠正方向，长边缩放到 1568，再压缩传给视觉模型。
-- OCR 优先 `chi_sim+eng`，没有中文语言包时降级为英文。
-- 抽取文本最多 60000 字符，避免请求体和模型费用失控。
-
-OCR 和视觉模型职责不同：OCR 擅长读取文字，视觉模型负责主体、场景、构图和语义理解。项目将 OCR 结果作为视觉分析的补充上下文。
-
-## 12. OSS 安全设计
-
-对象键结构：
-
-```text
-{prefix}/{owner_id}/{yyyy}/{mm}/{dd}/{uuid}.{ext}
-```
-
-- AccessKey 只存在后端 `.env`。
-- Bucket 可保持私有，浏览器使用短期签名 URL。
-- 每次签名、删除、分析都会校验对象键的用户目录前缀。
-- 数据库保存稳定的 `object_key`，不保存会过期的 URL。
-- 读取历史时重新签名，因此刷新页面后图片仍可显示。
-
-生产环境建议使用 RAM 子账号、最小 Bucket 权限、定期轮换密钥和对象生命周期规则。
-
-## 13. 结构化表单消息
-
-当问题命中“创建笔记”白名单意图时，服务端返回 `note_create` 表单描述。前端只对代码中明确支持的 `kind` 渲染组件，不执行模型生成的任意 URL。
-
-表单提交时：
-
-1. 查询当前用户拥有的消息并加行锁。
-2. 检查消息类型和 `kind`。
-3. 同一事务创建 Note 并将表单标记为 `completed`。
-4. 重复提交返回第一次创建的 Note，保证幂等。
-
-这是把 Agent 接入真实业务时的重要原则：模型可以建议动作，但服务端必须控制权限、参数和可执行范围。
-
-## 14. API 一览
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET | `/health` | 健康检查 |
+| GET | `/health` | 进程存活检查 |
+| GET | `/ready` | MySQL/Qdrant 就绪检查 |
 | POST | `/auth/register` | 注册 |
 | POST | `/auth/login` | 登录并签发 JWT |
 | GET | `/users/me` | 当前用户 |
-| POST | `/notes` | 创建笔记 |
-| GET | `/notes` | 列表/关键字搜索 |
-| GET | `/notes/{id}` | 笔记详情 |
-| PUT | `/notes/{id}` | 更新笔记 |
-| DELETE | `/notes/{id}` | 删除笔记 |
-| POST | `/agent/chat` | 非流式问答 |
-| POST | `/agent/chat/stream` | SSE 流式问答 |
-| POST | `/uploads` | 上传 OSS |
-| DELETE | `/uploads` | 清理未发送附件 |
-| POST | `/agent/files/analyze` | SSE 文件分析 |
-| POST | `/agent/forms/note` | 提交聊天内笔记表单 |
-| GET | `/agent/sessions/{id}/messages` | 恢复会话历史 |
+| POST/GET | `/notes` | 创建/查询笔记 |
+| GET/PUT/DELETE | `/notes/{id}` | 笔记详情、更新、删除 |
+| POST | `/knowledge/reindex` | 重建当前用户向量索引 |
+| GET | `/knowledge/tasks/{id}` | 查询异步索引任务状态 |
+| GET | `/metrics` | Prometheus 指标（Nginx 示例限制为本机访问） |
+| POST | `/agent/chat` | LangGraph 同步问答 |
+| POST | `/agent/chat/stream` | SSE 流式 RAG 问答 |
+| POST | `/agent/files/analyze` | 文件/OCR/图片流式分析 |
+| POST/DELETE | `/uploads` | OSS 上传/删除 |
+| POST | `/agent/forms/note` | 提交受控创建笔记表单 |
+| GET | `/agent/sessions/{id}/messages` | 恢复聊天历史 |
 
-普通 JSON 响应统一为：
+## 10. 数据与事务设计
 
-```json
-{
-  "data": {},
-  "code": 200,
-  "message": "success"
-}
-```
+- `users`：账号、密码哈希、创建时间。
+- `notes`：知识笔记，通过 `owner_id` 隔离用户。
+- `agent_sessions`：对话会话。
+- `agent_messages`：文本、引用快照、附件和结构化表单 JSON。
+- Qdrant `note_chunks`：向量与最小检索 payload，不作为业务真实数据源。
 
-## 15. 数据库迁移
+CRUD 层不主动提交事务；Service 决定 commit/rollback。流式问答先短事务保存用户消息，再释放连接执行耗时模型调用，最后用短事务保存完整答案，避免 SSE 持续数分钟时占住连接池。
 
-```bash
-alembic current
-alembic upgrade head
-alembic revision --autogenerate -m "说明结构变更"
-alembic downgrade -1
-```
+## 11. 文件、图片与 OSS
 
-`create_all()` 适合一次性 Demo，但无法审查和追踪生产结构变化。Alembic 让每次 DDL 变更都有版本，可进入代码评审和发布流程。
+- PDF 使用 pypdf 提取文本。
+- DOCX 提取段落文本。
+- TXT/Markdown 按安全编码读取。
+- 图片用 Pillow 校验，Tesseract 执行 OCR；配置视觉模型时可发送 Anthropic image 内容块。
+- 上传大小和类型在服务端限制，不能只相信前端校验。
+- 上传按 1 MB 分块读取，累计超过 10 MB 立即返回 413，避免先无限读入内存再校验。
+- OSS 对象键带用户目录前缀；签名、删除、分析都会再次校验归属。
+- 数据库保存稳定 `object_key`，读取历史时重新生成短期 URL。
 
-## 16. 验证与调试
-
-```bash
-# Python 语法检查
-.venv/bin/python -m compileall -q app
-
-# 健康检查
-curl http://127.0.0.1:8000/health
-
-# 查看迁移版本
-.venv/bin/alembic current
-```
-
-建议补充的自动化测试：
-
-- 注册并发与 JWT 过期测试。
-- Note/Session 水平越权测试。
-- SSE 半包和 error 事件集成测试。
-- 文件格式、超限、损坏、压缩炸弹测试。
-- OSS 对象归属和签名 URL 测试。
-- 表单重复提交幂等测试。
-
-## 17. 面试讲法
+## 12. 面试介绍
 
 ### 30 秒版本
 
-> 我做了一个 FastAPI + React 的个人知识库 Agent。后端用 JWT 做认证，SQLAlchemy 和 Alembic 管理用户、笔记、会话和消息；Agent 先检索当前用户真实命中的笔记，再通过 Anthropic 兼容模型回答，并用 SSE 流式返回。项目还支持 OSS 私有附件、PDF/DOCX/OCR/视觉分析和聊天内受控表单。架构上 Route、Service、CRUD、Agent 和 Storage 分层，Service 统一控制权限和事务。
+> 我做了一个 FastAPI + React 的个人知识库 Agent。后端用 JWT、SQLAlchemy 和 Alembic 管理多用户笔记及会话；知识库会把笔记重叠切块，用 FastEmbed 生成中文向量并写入 Qdrant，查询时按用户过滤做语义召回，再通过 LangGraph 编排检索和模型生成，并用 SSE 流式返回答案及真实引用。项目还支持文件/OCR/视觉分析、OSS 私有附件和聊天内受控表单，生产侧用 Docker Compose 编排 MySQL、Qdrant、迁移任务与多 worker API。
 
 ### 2 分钟展开顺序
 
-1. 先讲业务闭环：登录、写笔记、提问、引用、刷新恢复。
-2. 再讲分层：Route 适配 HTTP，Service 管业务事务，CRUD 管 SQL，Agent 管模型。
-3. 讲 SSE：为什么不用 EventSource、如何处理增量和错误。
-4. 讲安全：JWT、owner_id、OSS 前缀、服务端表单白名单。
-5. 讲工程取舍：短事务、引用快照、Mock 降级、Alembic。
-6. 最后主动说明当前检索是 LIKE，生产化会升级为 embedding + vector DB + rerank。
+1. 先说业务：个人笔记进入知识库，聊天时优先用自己的资料回答。
+2. 再说分层：Route、Schema、Service、CRUD、Agent、Vector Store、Storage。
+3. 重点说 RAG：切块、Embedding、Qdrant、多租户过滤、Top-K、真实引用、降级与 reindex。
+4. 说 Agent：LangGraph 两节点确定性编排，流式路径复用节点能力，Service 管 SSE 生命周期。
+5. 说工程：JWT、事务边界、幂等表单、OSS 权限、短期签名 URL、统一错误响应。
+6. 最后说生产：MySQL/Qdrant 持久化、迁移先行、就绪探针、非 root、Nginx HTTPS/SSE、备份监控边界。
 
-### 高频追问
+### 常见追问
 
-**为什么使用 SSE 而不是 WebSocket？** 该场景主要是服务端单向推送，SSE 更简单、可读；如果需要双向实时协作、语音或大量客户端事件，再考虑 WebSocket。
+**为什么用 Qdrant？** 关系库负责强一致业务数据，Qdrant 专注高维相似度搜索、payload filter 和 Top-K 召回，职责清晰；后续也便于独立扩容。
 
-**为什么 CRUD 不 commit？** 一个业务动作可能包含多次数据库修改，只有 Service 知道完整原子边界。CRUD 自行提交会导致中途失败时无法整体回滚。
+**如何保证多用户隔离？** JWT 得到当前用户；所有 MySQL 查询校验 `owner_id`；Qdrant 查询也强制 `owner_id` filter；召回后回表再校验一次。
 
-**为什么模型调用期间不持有事务？** 模型耗时不稳定，长事务会占连接、增加锁等待。先保存用户消息，调用结束后再短事务保存回答。
+**向量库写失败怎么办？** MySQL 是真实数据源，业务事务同时写 Outbox；独立 Worker 重试 Qdrant 操作，查询可降级，运维也能异步 reindex。更大规模可把数据库 Outbox 通过 CDC 投递 Kafka，并增加死信队列和告警。
 
-**RAG 是否真的使用向量数据库？** 当前版本是关键词检索，用于展示完整 RAG 数据流；生产化会引入分块、embedding、向量召回、metadata 过滤和 rerank。
+**为什么切块有 overlap？** 避免语义跨边界被截断。当前字符切块实现简单稳定；生产可升级为 Markdown 结构/token 切块，并用离线评测优化 chunk size、Top-K 与 rerank。
 
-**如何防止引用造假？** 只把真实检索结果传给模型，无命中就传明确的空上下文；前端引用来自服务端 `sources`，历史引用保存生成时快照。
+**LangGraph 是否只是装了包？** 不是，同步问答实际编译并执行 `retrieve_notes -> generate_answer` 状态图。当前是可解释的确定性工作流，不夸大成开放式自主 Agent。
 
-**如何保护 OSS？** 长期 AccessKey 不进浏览器；对象按用户目录隔离，每次操作校验归属，只返回短期签名 URL。
+**为什么 SSE 而不是 WebSocket？** 业务主要是服务端单向增量输出；SSE 协议简单。使用 `fetch` 解析 SSE，因为请求需要 POST JSON 和 Authorization Header。
 
-## 18. 当前边界与生产化方向
+**生产还缺什么？** 单机版缺跨机高可用、自动备份、WAF/限流、集中可观测性和灰度发布；README 已给出明确上线清单，避免把演示部署误称为大型生产架构。
 
-当前已实现的是可运行的学习/面试项目，不应在面试中把下列方向说成已经完成：
+## 13. 测试与检查
 
-- 将 LIKE 检索升级为 embedding、向量数据库、混合检索和 rerank。
-- Redis 保存会话热点、限流和分布式幂等状态。
-- 模型超时重试、熔断、多供应商降级和成本监控。
-- 后台任务处理超大文件、扫描 PDF OCR 和病毒检测。
-- 完整 pytest、容器化、CI/CD、日志链路和可观测性。
-- OSS 使用 STS 临时凭证、回调校验和生命周期自动清理。
+```bash
+python -m compileall -q app
+python -m unittest discover -s tests -v
+alembic upgrade head
+docker compose --env-file .env.production config
+```
 
-主动说明边界比把 Demo 包装成生产系统更可信。
+生产构建会下载并固化 embedding 模型，因此第一次构建较慢、镜像也会增大。若部署环境不允许构建时访问模型仓库，应在 CI 中构建并推送镜像，服务器只拉取经过验证的镜像。
 
-## 19. 常见故障
+## 14. 当前仍需完善的方向
 
-- 401：检查 Bearer Token、JWT 过期时间和本机 `SECRET_KEY` 是否变化。
-- 数据表缺失：执行 `alembic upgrade head`。
-- 模型不可用：检查 token、base URL、模型名和 Anthropic 协议兼容性。
-- 图片不能理解：确认视觉模型支持 `image` 内容块及 `ANTHROPIC_VISION_ENABLED=true`。
-- OCR 中文失败：安装 Tesseract `chi_sim` 语言包。
-- OSS 503：检查 Bucket、Endpoint、AccessKey 和 RAM 权限。
-- 历史图片失效：数据库应保存 `object_key`，读取历史时由后端重新签名。
-- SSE 被代理一次性返回：Nginx 关闭 proxy buffering，后端已设置 `X-Accel-Buffering: no`。
+以下项目经过审查后仍属于明确的后续工作，不应在面试中描述为已经完成：
 
-## 20. 配套前端
-
-前端项目：`../agent-frontfond`
-
-开发环境先启动本服务的 `8000` 端口，再启动前端的 `5173` 端口。前端通过 Vite 将 `/api` 代理到 FastAPI。
+1. **消息基础设施升级**：当前已实现数据库事务 Outbox、独立 Worker、租约恢复和指数退避。多机高吞吐场景可进一步使用 CDC + Kafka/RabbitMQ、独立死信队列和任务积压告警。
+2. **检索质量评测**：目前已实现向量召回、关键词混合重排与本地降级，但还没有离线标注集、Recall@K、MRR、答案忠实度评测和 cross-encoder reranker。
+3. **编排持久化**：LangGraph 已有节点重试，但还没有持久化 checkpoint、人工审核和跨进程长任务恢复。复杂工具 Agent 应增加共享 checkpoint store 和 human-in-the-loop。
+4. **异步任务范围**：reindex 和笔记 embedding 已进入 Worker；文件 OCR 与视觉分析仍在 API 进程，大文件/批处理应进一步迁移到任务队列。
+5. **分布式限流与配额**：当前有应用级基础限流，但多 worker/多机下应使用 Redis 或 API Gateway 统一计算用户并发、速率和模型成本配额。
+6. **深度可观测性**：当前已有 request ID、Prometheus 请求量/延迟和访问日志；仍需 OpenTelemetry trace、模型 token/耗时、召回命中率、Qdrant 延迟、SSE 中断率和告警规则。
+7. **高可用与灾备**：已有 MySQL dump、Qdrant snapshot 脚本基线；生产仍需要异地存储、自动调度、恢复演练、托管/集群数据库、滚动发布和容量压测。
+8. **测试覆盖**：当前覆盖 HTTP/SSE 合同、基础限流、Outbox 原子提交/回滚、向量切块和租户过滤；仍需真实 MySQL/Qdrant Testcontainers、鉴权越权、Worker 崩溃恢复和端到端测试。

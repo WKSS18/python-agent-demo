@@ -7,22 +7,36 @@
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
+import os
+
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest, multiprocess
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.config import get_settings
-from app.database import check_database_connection, get_db
+from app.database import check_dependencies, get_db
 from app.deps import get_current_user
-from app.file_parser import parse_uploaded_file
+from app.file_parser import parse_uploaded_file, read_upload_limited
 from app.responses import register_exception_handlers, success
 from app.security import create_access_token
-from app.services import AgentService, AuthService, NoteService
+from app.services import AgentService, AuthService, KnowledgeService, NoteService
+from app.middleware import RequestMiddleware
 from app.storage import OssStorage
 
 
 settings = get_settings()
 app = FastAPI(title=settings.app_name)
+app.add_middleware(RequestMiddleware, rate_limit_enabled=settings.rate_limit_enabled)
+if settings.cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 register_exception_handlers(app)
 
 
@@ -34,11 +48,24 @@ def health_check() -> schemas.ApiResponse[dict[str, str]]:
     return success({"status": "ok"})
 
 
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    if not settings.metrics_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    if os.getenv("PROMETHEUS_MULTIPROC_DIR"):
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        payload = generate_latest(registry)
+    else:
+        payload = generate_latest()
+    return Response(payload, media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/ready", response_model=schemas.ApiResponse[dict[str, str]])
 def readiness_check() -> schemas.ApiResponse[dict[str, str]]:
     """就绪探针：数据库可连接时才允许流量进入。"""
     try:
-        check_database_connection()
+        check_dependencies()
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -127,6 +154,31 @@ def delete_note(
     return success(message="删除成功")
 
 
+@app.post(
+    "/knowledge/reindex",
+    response_model=schemas.ApiResponse[schemas.KnowledgeIndexTaskRead],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def reindex_knowledge_base(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+) -> schemas.ApiResponse[schemas.KnowledgeIndexTaskRead]:
+    """Enqueue an asynchronous rebuild of the current user's vectors."""
+    return success(KnowledgeService(db).enqueue_reindex(owner_id=current_user.id))
+
+
+@app.get(
+    "/knowledge/tasks/{task_id}",
+    response_model=schemas.ApiResponse[schemas.KnowledgeIndexTaskRead],
+)
+def get_knowledge_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+) -> schemas.ApiResponse[schemas.KnowledgeIndexTaskRead]:
+    return success(KnowledgeService(db).get_task(current_user.id, task_id))
+
+
 # ------------------------------ Agent 与 SSE ------------------------------
 
 
@@ -164,8 +216,7 @@ async def analyze_uploaded_file(
     current_user: models.User = Depends(get_current_user),
 ) -> StreamingResponse:
     """先在服务端提取文本或执行 OCR，再通过 SSE 返回模型分析结果。"""
-    content = await file.read()
-    await file.close()
+    content = await read_upload_limited(file)
     parsed_file = parse_uploaded_file(file.filename, file.content_type, content)
     return StreamingResponse(
         AgentService.stream_file_analysis(
@@ -189,8 +240,7 @@ async def upload_file(
     current_user: models.User = Depends(get_current_user),
 ) -> schemas.ApiResponse[schemas.UploadedFile]:
     """由后端持有 OSS 凭证，上传私有对象并返回短期签名预览 URL。"""
-    content = await file.read()
-    await file.close()
+    content = await read_upload_limited(file)
     uploaded = OssStorage().upload(
         owner_id=current_user.id,
         filename=file.filename,

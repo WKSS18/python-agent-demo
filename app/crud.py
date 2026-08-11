@@ -4,7 +4,9 @@
 事务边界由 Service 按完整业务动作统一控制，这样多个写操作可以保证原子性。
 """
 
-from sqlalchemy import select
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app import models
@@ -41,8 +43,69 @@ def get_note(db: Session, note_id: int) -> models.Note | None:
     return db.get(models.Note, note_id)
 
 
+def list_owned_notes_by_ids(db: Session, owner_id: int, note_ids: list[int]) -> list[models.Note]:
+    if not note_ids:
+        return []
+    query = select(models.Note).where(models.Note.owner_id == owner_id, models.Note.id.in_(note_ids))
+    notes = {note.id: note for note in db.scalars(query)}
+    return [notes[note_id] for note_id in note_ids if note_id in notes]
+
+
 def delete_note(db: Session, note: models.Note) -> None:
     db.delete(note)
+
+
+def add_index_job(
+    db: Session,
+    operation: str,
+    owner_id: int,
+    note_id: int | None = None,
+) -> models.KnowledgeIndexJob:
+    job = models.KnowledgeIndexJob(operation=operation, owner_id=owner_id, note_id=note_id)
+    db.add(job)
+    db.flush()
+    return job
+
+
+def get_owned_index_job(db: Session, job_id: int, owner_id: int) -> models.KnowledgeIndexJob | None:
+    return db.scalar(
+        select(models.KnowledgeIndexJob).where(
+            models.KnowledgeIndexJob.id == job_id,
+            models.KnowledgeIndexJob.owner_id == owner_id,
+        ),
+    )
+
+
+def recover_stale_index_jobs(db: Session, stale_minutes: int = 10) -> int:
+    cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=stale_minutes)
+    result = db.execute(
+        update(models.KnowledgeIndexJob)
+        .where(
+            models.KnowledgeIndexJob.status == "processing",
+            models.KnowledgeIndexJob.locked_at < cutoff,
+        )
+        .values(status="pending", locked_at=None, last_error="worker lease expired"),
+    )
+    return result.rowcount or 0
+
+
+def claim_index_jobs(db: Session, limit: int = 10) -> list[models.KnowledgeIndexJob]:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    query = (
+        select(models.KnowledgeIndexJob)
+        .where(
+            models.KnowledgeIndexJob.status == "pending",
+            models.KnowledgeIndexJob.available_at <= now,
+        )
+        .order_by(models.KnowledgeIndexJob.id)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    jobs = list(db.scalars(query))
+    for job in jobs:
+        job.status = "processing"
+        job.locked_at = now
+    return jobs
 
 
 def get_agent_session(db: Session, session_id: int) -> models.AgentSession | None:
