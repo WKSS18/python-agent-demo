@@ -8,12 +8,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import logging
+import time
 from typing import Iterable
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 
 from app.config import get_settings
+
+
+logger = logging.getLogger(__name__)
 
 
 CHUNK_SIZE = 500
@@ -45,8 +50,10 @@ class VectorStore:
         self.collection = settings.qdrant_collection
         self.timeout = settings.vector_request_timeout_seconds
         self.api_key = settings.qdrant_api_key
+        self.score_threshold = settings.rag_vector_score_threshold
 
     def index_note(self, owner_id: int, note_id: int, title: str, content: str) -> int:
+        started = time.perf_counter()
         chunks = split_note(title, content)
         vectors = _embed(chunks)
         self._ensure_collection(len(vectors[0]))
@@ -68,6 +75,13 @@ class VectorStore:
                 },
             )
         self._request("PUT", f"/collections/{self.collection}/points", params={"wait": "true"}, json={"points": points})
+        logger.info(
+            "vector_note_indexed",
+            extra={
+                "event": "vector_note_indexed", "owner_id": owner_id, "note_id": note_id,
+                "chunk_count": len(points), "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            },
+        )
         return len(points)
 
     def delete_note(self, owner_id: int, note_id: int) -> None:
@@ -89,6 +103,7 @@ class VectorStore:
         )
 
     def search(self, owner_id: int, query: str, limit: int) -> list[VectorHit]:
+        started = time.perf_counter()
         vector = _embed([query])[0]
         payload = self._request(
             "POST",
@@ -96,6 +111,7 @@ class VectorStore:
             json={
                 "vector": vector,
                 "limit": limit,
+                "score_threshold": self.score_threshold,
                 "with_payload": True,
                 "filter": {"must": [_match("owner_id", owner_id)]},
             },
@@ -104,8 +120,18 @@ class VectorStore:
         hits: list[VectorHit] = []
         for item in payload.get("result", []) if payload else []:
             data = item.get("payload") or {}
-            if isinstance(data.get("note_id"), int):
-                hits.append(VectorHit(note_id=data["note_id"], chunk=str(data.get("chunk", "")), score=float(item.get("score", 0))))
+            score = float(item.get("score", 0))
+            if isinstance(data.get("note_id"), int) and score >= self.score_threshold:
+                hits.append(VectorHit(note_id=data["note_id"], chunk=str(data.get("chunk", "")), score=score))
+        logger.info(
+            "vector_search_completed",
+            extra={
+                "event": "vector_search_completed", "owner_id": owner_id,
+                "hit_count": len(hits), "top_score": round(hits[0].score, 4) if hits else 0,
+                "threshold": self.score_threshold,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            },
+        )
         return hits
 
     def check(self) -> None:
@@ -157,7 +183,14 @@ def _embedding_model():
     from fastembed import TextEmbedding
 
     settings = get_settings()
-    return TextEmbedding(model_name=settings.embedding_model, cache_dir=settings.embedding_cache_dir)
+    model_options = {
+        "model_name": settings.embedding_model,
+        "cache_dir": settings.embedding_cache_dir,
+        "local_files_only": settings.embedding_local_files_only,
+    }
+    if settings.embedding_model_path:
+        model_options["specific_model_path"] = settings.embedding_model_path
+    return TextEmbedding(**model_options)
 
 
 def _embed(texts: Iterable[str]) -> list[list[float]]:

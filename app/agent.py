@@ -6,6 +6,8 @@
 """
 
 import base64
+import logging
+import time
 from collections.abc import Callable
 from typing import Any, TypedDict
 
@@ -15,6 +17,9 @@ from langgraph.types import RetryPolicy
 
 from app import schemas
 from app.config import get_settings
+
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = (
@@ -134,18 +139,62 @@ def _stream_model(
             yield mock_answer[index:index + 12]
         return
 
+    selected_model = model or settings.anthropic_model
+    started = time.perf_counter()
+    first_token_at: float | None = None
+    output_chars = 0
+    outcome = "success"
     client = Anthropic(
         api_key=settings.anthropic_auth_token,
         base_url=settings.anthropic_base_url,
         timeout=settings.api_timeout_ms / 1000,
     )
     with client.messages.stream(
-        model=model or settings.anthropic_model,
+        model=selected_model,
         max_tokens=2_048,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
     ) as stream:
-        yield from stream.text_stream
+        try:
+            for text in stream.text_stream:
+                if first_token_at is None:
+                    first_token_at = time.perf_counter()
+                output_chars += len(text)
+                yield text
+            final_message = stream.get_final_message()
+            usage = final_message.usage
+            logger.info(
+                "model_stream_completed",
+                extra={
+                    "event": "model_stream_completed", "model": selected_model,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                    "ttft_ms": round(((first_token_at or time.perf_counter()) - started) * 1000, 1),
+                    "input_tokens": getattr(usage, "input_tokens", None),
+                    "output_tokens": getattr(usage, "output_tokens", None),
+                    "outcome": outcome,
+                },
+            )
+        except GeneratorExit:
+            outcome = "client_disconnected"
+            logger.warning(
+                "model_stream_disconnected",
+                extra={
+                    "event": "model_stream_disconnected", "model": selected_model,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                    "outcome": outcome,
+                },
+            )
+            raise
+        except Exception:
+            logger.exception(
+                "model_stream_failed",
+                extra={
+                    "event": "model_stream_failed", "model": selected_model,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                    "outcome": "failed",
+                },
+            )
+            raise
 
 
 def run_agent(

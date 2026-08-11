@@ -23,9 +23,11 @@ from app.responses import register_exception_handlers, success
 from app.security import create_access_token
 from app.services import AgentService, AuthService, KnowledgeService, NoteService
 from app.middleware import RequestMiddleware
+from app.logging_config import configure_logging
 from app.storage import OssStorage
 
 
+configure_logging()
 settings = get_settings()
 app = FastAPI(title=settings.app_name)
 app.add_middleware(RequestMiddleware, rate_limit_enabled=settings.rate_limit_enabled)
@@ -114,6 +116,29 @@ def create_note(
     current_user: models.User = Depends(get_current_user),
 ) -> schemas.ApiResponse[schemas.NoteRead]:
     return success(NoteService(db).create(owner_id=current_user.id, data=data))
+
+
+@app.post("/notes/import", response_model=schemas.ApiResponse[schemas.NoteRead])
+async def import_note_document(
+    file: UploadFile = File(...),
+    title: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+) -> schemas.ApiResponse[schemas.NoteRead]:
+    """Parse a document into a note; NoteService then queues its vector indexing job."""
+    content = await read_upload_limited(file)
+    parsed = parse_uploaded_file(file.filename, file.content_type, content)
+    if not parsed.text.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="文档中没有提取到可用于知识检索的文字。",
+        )
+    note_title = (title or os.path.splitext(parsed.name)[0]).strip()[:200]
+    note = NoteService(db).create(
+        owner_id=current_user.id,
+        data=schemas.NoteCreate(title=note_title or "导入的文档", content=parsed.text[:50_000]),
+    )
+    return success(note, message="文档已解析为笔记，知识索引正在后台建立。")
 
 
 @app.get("/notes", response_model=schemas.ApiResponse[list[schemas.NoteRead]])
@@ -258,6 +283,17 @@ def delete_uploaded_file(
     """移除附件时清理尚未发送的 OSS 对象。"""
     OssStorage().delete(owner_id=current_user.id, object_key=data.object_key)
     return success(message="附件已删除")
+
+
+@app.get("/uploads/local/{object_key:path}", include_in_schema=False)
+def read_local_attachment(
+    object_key: str,
+    expires: int = Query(...),
+    signature: str = Query(...),
+) -> Response:
+    """Serve a private local attachment only through a short-lived signed URL."""
+    content, media_type = OssStorage().read_local_signed(object_key, expires, signature)
+    return Response(content=content, media_type=media_type, headers={"Cache-Control": "private, max-age=300"})
 
 
 # ------------------------------ 结构化表单与历史 ------------------------------

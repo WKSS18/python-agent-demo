@@ -32,6 +32,7 @@ def process_batch(limit: int = 10) -> int:
 
 
 def _process_job(job_id: int) -> None:
+    started = time.perf_counter()
     with SessionLocal() as db:
         job = db.get(models.KnowledgeIndexJob, job_id)
         if not job or job.status != "processing":
@@ -47,6 +48,14 @@ def _process_job(job_id: int) -> None:
                 (note.owner_id, note.id, note.title, note.content)
                 for note in crud.list_notes(db, owner_id=owner_id)
             ]
+
+    logger.info(
+        "knowledge_job_started",
+        extra={
+            "event": "knowledge_job_started", "job_id": job_id, "operation": operation,
+            "owner_id": owner_id, "note_id": note_id, "attempts": job.attempts,
+        },
+    )
 
     error: Exception | None = None
     try:
@@ -87,10 +96,20 @@ def _process_job(job_id: int) -> None:
                 delay = min(300, 2 ** job.attempts)
                 job.available_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(seconds=delay)
         db.commit()
+    logger.info(
+        "knowledge_job_finished",
+        extra={
+            "event": "knowledge_job_finished", "job_id": job_id, "operation": operation,
+            "owner_id": owner_id, "note_id": note_id,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            "outcome": "success" if error is None else "retry_or_failed",
+        },
+    )
 
 
 def run_forever(poll_seconds: float = 2.0) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    from app.logging_config import configure_logging
+    configure_logging()
     logger.info("Knowledge worker started")
     while True:
         processed = process_batch()

@@ -44,9 +44,12 @@ class Settings(BaseSettings):
     qdrant_collection: str = "note_chunks"
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
     embedding_cache_dir: str = ".cache/fastembed"
+    embedding_local_files_only: bool = False
+    embedding_model_path: str = ""
     vector_request_timeout_seconds: float = 10.0
     rag_top_k: int = 5
     rag_candidate_limit: int = 12
+    rag_vector_score_threshold: float = 0.55
     rate_limit_enabled: bool = True
     metrics_enabled: bool = True
     # OSS 配置：长期密钥仅由后端读取，浏览器只接触短期签名 URL。
@@ -56,6 +59,9 @@ class Settings(BaseSettings):
     oss_bucket: str = ""
     oss_object_prefix: str = "ai-agent-demo"
     oss_signed_url_expire_seconds: int = 3_600
+    attachment_storage_backend: str = "auto"
+    local_upload_dir: str = "/data/uploads"
+    local_upload_url_prefix: str = "/api/uploads/local"
 
     model_config = SettingsConfigDict(
         env_file=".env",

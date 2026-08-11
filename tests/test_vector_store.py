@@ -38,6 +38,23 @@ class SplitNoteTests(unittest.TestCase):
         request = store._request.call_args
         must = request.kwargs["json"]["filter"]["must"]
         self.assertEqual(must, [{"key": "owner_id", "match": {"value": 9}}])
+        self.assertEqual(request.kwargs["json"]["score_threshold"], store.score_threshold)
+
+    @patch("app.vector_store._embed", return_value=[[0.1, 0.2]])
+    def test_search_discards_hits_below_relevance_threshold(self, _: Mock) -> None:
+        store = VectorStore()
+        store._request = Mock(
+            return_value={
+                "result": [
+                    {"score": store.score_threshold - 0.01, "payload": {"note_id": 1, "chunk": "unrelated"}},
+                    {"score": store.score_threshold + 0.01, "payload": {"note_id": 2, "chunk": "related"}},
+                ],
+            },
+        )
+
+        hits = store.search(9, "question", 5)
+
+        self.assertEqual([hit.note_id for hit in hits], [2])
 
 
 if __name__ == "__main__":

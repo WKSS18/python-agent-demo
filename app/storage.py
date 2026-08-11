@@ -5,6 +5,11 @@
 """
 
 from datetime import UTC, datetime
+import hashlib
+import hmac
+from pathlib import Path
+import time
+from urllib.parse import quote
 from uuid import uuid4
 
 import oss2
@@ -30,12 +35,23 @@ class OssStorage:
     ) -> schemas.UploadedFile:
         """把私有文件写入 OSS，并只返回短期可访问的签名 URL。"""
         upload = validate_upload(filename, media_type, content)
-        bucket = self._bucket()
         date_path = datetime.now(UTC).strftime("%Y/%m/%d")
         object_key = (
             f"{self.settings.oss_object_prefix.strip('/')}/{owner_id}/"
             f"{date_path}/{uuid4().hex}{upload.suffix}"
         )
+        if self._use_local_storage():
+            path = self._local_path(object_key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            return schemas.UploadedFile(
+                name=upload.name,
+                media_type=upload.media_type,
+                size=upload.size,
+                object_key=object_key,
+                url=self.sign_get_url(owner_id, object_key),
+            )
+        bucket = self._bucket()
         try:
             result = bucket.put_object(
                 object_key,
@@ -61,6 +77,11 @@ class OssStorage:
     def sign_get_url(self, owner_id: int, object_key: str) -> str:
         """校验对象归属后生成临时 GET 地址，数据库无需保存会过期的 URL。"""
         self.ensure_owned(owner_id, object_key)
+        if self._use_local_storage():
+            expires = int(time.time()) + self.settings.oss_signed_url_expire_seconds
+            signature = self._local_signature(object_key, expires)
+            encoded_key = quote(object_key, safe="/")
+            return f"{self.settings.local_upload_url_prefix.rstrip('/')}/{encoded_key}?expires={expires}&signature={signature}"
         try:
             return self._bucket().sign_url(
                 "GET",
@@ -74,6 +95,9 @@ class OssStorage:
     def delete(self, owner_id: int, object_key: str) -> None:
         """删除用户已上传但尚未发送的对象，避免 OSS 残留垃圾文件。"""
         self.ensure_owned(owner_id, object_key)
+        if self._use_local_storage():
+            self._local_path(object_key).unlink(missing_ok=True)
+            return
         try:
             self._bucket().delete_object(object_key)
         except (oss2.exceptions.OssError, oss2.exceptions.RequestError) as exc:
@@ -108,3 +132,41 @@ class OssStorage:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="OSS 尚未配置。")
         auth = oss2.Auth(self.settings.oss_access_key_id, self.settings.oss_access_key_secret)
         return oss2.Bucket(auth, self.settings.oss_endpoint, self.settings.oss_bucket)
+
+    def read_local_signed(self, object_key: str, expires: int, signature: str) -> tuple[bytes, str]:
+        """Validate an expiring HMAC URL and read an opaque local attachment."""
+        if not self._use_local_storage():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="附件不存在。")
+        if expires < int(time.time()) or not hmac.compare_digest(signature, self._local_signature(object_key, expires)):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="附件链接无效或已过期。")
+        path = self._local_path(object_key)
+        if not path.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="附件不存在。")
+        media_types = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".webp": "image/webp", ".pdf": "application/pdf", ".txt": "text/plain",
+            ".md": "text/markdown", ".csv": "text/csv",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        }
+        return path.read_bytes(), media_types.get(path.suffix.lower(), "application/octet-stream")
+
+    def _use_local_storage(self) -> bool:
+        backend = self.settings.attachment_storage_backend.lower()
+        if backend == "local":
+            return True
+        if backend == "oss":
+            return False
+        return not all((self.settings.oss_access_key_id, self.settings.oss_access_key_secret,
+                        self.settings.oss_endpoint, self.settings.oss_bucket))
+
+    def _local_path(self, object_key: str) -> Path:
+        root = Path(self.settings.local_upload_dir).resolve()
+        path = (root / object_key).resolve()
+        if root not in path.parents:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="附件路径无效。")
+        return path
+
+    def _local_signature(self, object_key: str, expires: int) -> str:
+        return hmac.new(
+            self.settings.secret_key.encode(), f"{object_key}:{expires}".encode(), hashlib.sha256,
+        ).hexdigest()

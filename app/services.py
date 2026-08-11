@@ -88,6 +88,10 @@ class NoteService(BaseService):
             crud.add_index_job(self.db, "upsert", owner_id, note_id=note.id)
         self._commit()
         self.db.refresh(note)
+        logger.info(
+            "note_created",
+            extra={"event": "note_created", "owner_id": owner_id, "note_id": note.id},
+        )
         return note
 
     def list(self, owner_id: int, keyword: str | None = None) -> list[models.Note]:
@@ -108,6 +112,10 @@ class NoteService(BaseService):
             crud.add_index_job(self.db, "upsert", owner_id, note_id=note.id)
         self._commit()
         self.db.refresh(note)
+        logger.info(
+            "note_updated",
+            extra={"event": "note_updated", "owner_id": owner_id, "note_id": note.id},
+        )
         return note
 
     def delete(self, owner_id: int, note_id: int) -> None:
@@ -116,6 +124,10 @@ class NoteService(BaseService):
             crud.add_index_job(self.db, "delete", owner_id, note_id=note_id)
         crud.delete_note(self.db, note)
         self._commit()
+        logger.info(
+            "note_deleted",
+            extra={"event": "note_deleted", "owner_id": owner_id, "note_id": note_id},
+        )
 
 
 class KnowledgeService(BaseService):
