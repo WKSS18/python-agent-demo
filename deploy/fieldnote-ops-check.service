@@ -1,0 +1,9 @@
+[Unit]
+Description=Fieldnote health, container, index queue and disk check
+After=docker.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/fieldnote/python-agent-demo
+ExecStart=/opt/fieldnote/python-agent-demo/deploy/ops_check.sh

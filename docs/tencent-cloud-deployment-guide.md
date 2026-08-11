@@ -513,6 +513,17 @@ sudo tail -f /var/log/nginx/access.log /var/log/nginx/error.log
 
 Docker `json-file` 已设置每个文件最大 10 MB、保留 5 个，避免日志无限占满磁盘。单机当前仍未接入腾讯云 CLS/Sentry 和自动告警；正式业务应将 JSON 日志采集到集中平台，并对 5xx、模型失败、索引最终失败和磁盘水位设置告警。
 
+## 13.4 性能、RAG 评测与灾备证据
+
+项目提供 `deploy/load_test.py`、`deploy/rag_eval.py`、`deploy/backup.sh`、`deploy/verify_backup.sh` 和 `deploy/ops_check.sh`。腾讯云实测结果及边界见 [evidence/README.md](evidence/README.md)。
+
+- 本机 FastAPI `/health`：1000 请求、10 并发、0 错误，524.6 RPS，P95 22.5 ms，P99 37.5 ms。
+- RAG 小型标注集：阈值 0.55 时 Recall@3 0.75、MRR 0.9375、无答案误引用率 0。
+- MySQL dump、Qdrant snapshot、SHA-256/gzip 校验已在服务器执行成功。
+- 运行检查覆盖 `/ready`、容器状态、索引失败/积压任务和磁盘使用率。
+
+systemd timer 每天执行备份、每 5 分钟执行运行检查。需要强调：健康接口压测不是 Chat 容量，10 问离线集合不是线上准确率，文件校验也不是隔离环境完整恢复；资深工程师应主动说明证据适用范围。
+
 ## 14. 面试讲解版本
 
 ### 30 秒版本

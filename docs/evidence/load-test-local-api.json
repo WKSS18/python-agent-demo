@@ -1,0 +1,18 @@
+{
+  "timestamp": "2026-08-11T03:07:43.747450+00:00",
+  "url": "http://127.0.0.1:8000/health",
+  "requests": 1000,
+  "concurrency": 10,
+  "successes": 1000,
+  "errors": 0,
+  "error_rate": 0.0,
+  "throughput_rps": 524.6,
+  "duration_seconds": 1.906,
+  "latency_ms": {
+    "mean": 18.87,
+    "p50": 17.72,
+    "p95": 22.5,
+    "p99": 37.5,
+    "max": 141.78
+  }
+}

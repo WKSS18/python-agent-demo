@@ -2,9 +2,11 @@
 
 一个面向个人知识管理场景的全栈 AI Agent 项目。后端使用 FastAPI、LangGraph、MySQL、Qdrant、FastEmbed 和 Anthropic Messages 兼容模型服务，前端使用 React、TypeScript、Vite 与 Ant Design X。
 
-项目不只是一次模型调用 Demo：它覆盖认证、用户数据隔离、知识笔记 CRUD、向量化知识库、RAG、会话记忆、SSE 流式输出、文件/OCR/图片分析、结构化表单、OSS 私有附件以及容器化生产部署。
+项目不只是一次模型调用 Demo：它覆盖认证、用户数据隔离、知识笔记 CRUD、文档导入与异步向量化、RAG、会话记忆、SSE 流式输出、文件/OCR/图片分析、结构化表单、私有附件以及容器化生产部署。
 
 配套前端位于 `../agent-frontfond`。
+
+腾讯云实际部署、故障排查和面试讲解见 [docs/tencent-cloud-deployment-guide.md](docs/tencent-cloud-deployment-guide.md)。
 
 ## 1. 项目亮点
 
@@ -18,16 +20,17 @@
 - 笔记事务与索引任务写入同一个 MySQL 事务；独立 `knowledge-worker` 消费 Outbox，失败指数退避并最多重试 6 次。
 - 全量 reindex 改为异步任务，接口立即返回任务 ID，可查询 pending/processing/completed/failed 状态。
 - Qdrant 暂时不可用时自动回退到本地关键词 + 哈希向量混合检索。
+- 向量召回应用 `0.55` 最低相关度阈值，避免 Top-K 在全部不相关时仍产生虚假引用。
 - 只将真实召回的笔记传给模型，引用来源由服务端产生并保存快照。
 - LangGraph 显式编排“检索知识 → 组织上下文 → 模型生成”流程。
 - LangGraph 模型节点带指数退避重试；向量候选按 75% 语义分 + 25% 关键词分混合重排。
 - SSE 逐段返回 `session/sources/delta/form/done/error` 事件。
 - 模型调用期间不长期占用数据库连接和事务。
-- 支持 PDF、DOCX、TXT、Markdown、图片 OCR 与视觉模型分析。
-- OSS 使用用户目录隔离和短期签名 URL，长期密钥不进入浏览器。
-- Docker Compose 提供 MySQL、Qdrant、迁移任务和多 worker API。
+- 支持 PDF、DOCX、TXT、Markdown、CSV、图片 OCR 与视觉模型分析；知识笔记页可直接导入文档并建立向量索引。
+- 附件存储支持阿里云 OSS 和本地持久卷；对象键按用户隔离，使用短期签名 URL，长期密钥不进入浏览器。
+- Docker Compose 提供 MySQL、Qdrant、迁移任务、API 和独立知识索引 Worker。
 - `/health` 用于存活检查，`/ready` 同时检查 MySQL 与已启用的 Qdrant。
-- 每个响应携带 `X-Request-ID`，提供 Prometheus `/metrics`、路由级基础限流和请求耗时日志。
+- 每个响应携带 `X-Request-ID`，提供 Prometheus `/metrics`、路由级基础限流，以及 API/RAG/模型/Worker JSON 日志和 Docker 日志轮转。
 - 笔记、问题和上传文件均有服务端硬限制，上传采用分块读取，在超过 10 MB 时提前终止。
 
 ## 2. 技术栈
@@ -39,8 +42,8 @@
 | 关系数据库 | SQLAlchemy 2、Alembic、MySQL/SQLite | 用户、笔记、会话、消息和事务 |
 | 向量知识库 | FastEmbed、Qdrant | 分块、Embedding、持久化和语义召回 |
 | Agent | LangGraph、Anthropic SDK | 状态图编排和模型协议适配 |
-| 文件能力 | pypdf、python-docx、Pillow、Tesseract | 文档解析、OCR 和图片分析 |
-| 对象存储 | 阿里云 OSS | 私有附件、签名预览、归属校验 |
+| 文件能力 | pypdf、OpenXML、Pillow、Tesseract | 文档解析、OCR 和图片分析 |
+| 附件存储 | 阿里云 OSS / Docker 持久卷 | 私有附件、签名预览、归属校验 |
 | 部署 | Docker、Compose、Nginx | 服务编排、迁移、健康检查、HTTPS/SSE 代理 |
 | 前端 | React、TypeScript、Vite、Ant Design X | 聊天、笔记、引用、附件和表单 UI |
 
@@ -76,7 +79,8 @@ app/agent.py         LangGraph 与模型调用
 app/rag.py           本地混合检索降级实现
 app/vector_store.py  切块、FastEmbed、Qdrant 适配
 app/file_parser.py   PDF/DOCX/文本/OCR 解析
-app/storage.py       OSS 私有对象与签名 URL
+app/storage.py       OSS/本地持久卷与签名 URL
+app/logging_config.py JSON 日志格式与请求关联上下文
 ```
 
 ## 4. 知识库与 RAG 流程
@@ -85,10 +89,11 @@ app/storage.py       OSS 私有对象与签名 URL
 
 ```text
 创建/更新笔记
-  -> MySQL 提交业务数据
+  -> MySQL 写入业务数据
+  -> 同一 MySQL 事务写入 knowledge_index_jobs Outbox
+  -> 提交事务
   -> 标题 + 正文切块（500，overlap 80）
   -> FastEmbed 生成中文语义向量
-  -> 同一 MySQL 事务写入 knowledge_index_jobs Outbox
   -> knowledge-worker 领取任务
   -> FastEmbed + Qdrant upsert
   -> payload 保存 owner_id、note_id、chunk_index、title、chunk
@@ -102,6 +107,7 @@ app/storage.py       OSS 私有对象与签名 URL
 用户问题
   -> FastEmbed 生成 query vector
   -> Qdrant 按 owner_id 过滤并召回候选分块
+  -> 丢弃相似度低于 0.55 的候选
   -> 语义分 75% + 关键词分 25% 混合重排
   -> 按 note_id 去重并取 Top-K
   -> 再从 MySQL 按 owner_id 查询笔记
@@ -169,9 +175,9 @@ npm run dev
 
 ```env
 ANTHROPIC_AUTH_TOKEN=replace-me
-ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
-ANTHROPIC_MODEL=deepseek-v4-flash
-ANTHROPIC_VISION_MODEL=deepseek-v4-flash
+ANTHROPIC_BASE_URL=https://your-anthropic-compatible-provider.example.com
+ANTHROPIC_MODEL=your-model-name
+ANTHROPIC_VISION_MODEL=your-vision-model-name
 API_TIMEOUT_MS=600000
 ```
 
@@ -184,11 +190,28 @@ QDRANT_API_KEY=replace-with-a-long-random-key
 QDRANT_COLLECTION=note_chunks
 EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 EMBEDDING_CACHE_DIR=/opt/fastembed-cache
+EMBEDDING_LOCAL_FILES_ONLY=true
+EMBEDDING_MODEL_PATH=/opt/fastembed-cache/fast-bge-small-zh-v1.5
 RAG_TOP_K=5
 RAG_CANDIDATE_LIMIT=12
+RAG_VECTOR_SCORE_THRESHOLD=0.55
 RATE_LIMIT_ENABLED=true
 METRICS_ENABLED=true
 ```
+
+附件存储（生产可选 OSS，本地开发可使用 `auto`）：
+
+```env
+ATTACHMENT_STORAGE_BACKEND=oss
+OSS_ACCESS_KEY_ID=replace-me
+OSS_ACCESS_KEY_SECRET=replace-me
+OSS_ENDPOINT=https://oss-cn-your-region.aliyuncs.com
+OSS_BUCKET=your-private-bucket
+OSS_OBJECT_PREFIX=ai-agent-demo
+OSS_SIGNED_URL_EXPIRE_SECONDS=3600
+```
+
+AccessKey 只能放在未纳入版本控制的 `.env`/`.env.production` 中。未配置 OSS 且使用 `auto` 时，系统回退到 `/data/uploads`；Compose 使用 `upload_data` 卷持久化附件。
 
 更换 `EMBEDDING_MODEL` 后向量维度或语义空间可能变化，应更换 collection 名或删除旧 collection，再执行全量 reindex。
 
@@ -260,6 +283,7 @@ Nginx 示例位于 `deploy/nginx.conf.example`，其中关闭了 `proxy_bufferin
 | POST | `/auth/login` | 登录并签发 JWT |
 | GET | `/users/me` | 当前用户 |
 | POST/GET | `/notes` | 创建/查询笔记 |
+| POST | `/notes/import` | 解析文档、创建笔记并异步建立向量索引 |
 | GET/PUT/DELETE | `/notes/{id}` | 笔记详情、更新、删除 |
 | POST | `/knowledge/reindex` | 重建当前用户向量索引 |
 | GET | `/knowledge/tasks/{id}` | 查询异步索引任务状态 |
@@ -267,7 +291,7 @@ Nginx 示例位于 `deploy/nginx.conf.example`，其中关闭了 `proxy_bufferin
 | POST | `/agent/chat` | LangGraph 同步问答 |
 | POST | `/agent/chat/stream` | SSE 流式 RAG 问答 |
 | POST | `/agent/files/analyze` | 文件/OCR/图片流式分析 |
-| POST/DELETE | `/uploads` | OSS 上传/删除 |
+| POST/DELETE | `/uploads` | 私有附件上传/删除（OSS 或本地持久卷） |
 | POST | `/agent/forms/note` | 提交受控创建笔记表单 |
 | GET | `/agent/sessions/{id}/messages` | 恢复聊天历史 |
 
@@ -281,16 +305,26 @@ Nginx 示例位于 `deploy/nginx.conf.example`，其中关闭了 `proxy_bufferin
 
 CRUD 层不主动提交事务；Service 决定 commit/rollback。流式问答先短事务保存用户消息，再释放连接执行耗时模型调用，最后用短事务保存完整答案，避免 SSE 持续数分钟时占住连接池。
 
-## 11. 文件、图片与 OSS
+## 11. 文件解析、Chat 附件与知识库导入
 
-- PDF 使用 pypdf 提取文本。
-- DOCX 提取段落文本。
-- TXT/Markdown 按安全编码读取。
-- 图片用 Pillow 校验，Tesseract 执行 OCR；配置视觉模型时可发送 Anthropic image 内容块。
+- TXT/Markdown/CSV 优先使用 UTF-8（含 BOM），并兼容 GB18030。
+- PDF 使用 pypdf 提取前 100 页文本层；加密 PDF 拒绝处理。扫描 PDF 尚未实现逐页转图片 OCR。
+- DOCX 直接读取 OpenXML 段落与表格文本节点。
+- 图片用 Pillow 校正方向、限制像素并压缩，Tesseract 执行中英文 OCR；配置视觉模型时可发送 Anthropic image 内容块。
 - 上传大小和类型在服务端限制，不能只相信前端校验。
 - 上传按 1 MB 分块读取，累计超过 10 MB 立即返回 413，避免先无限读入内存再校验。
-- OSS 对象键带用户目录前缀；签名、删除、分析都会再次校验归属。
+- 图片最多 2500 万像素，视觉输入最长边压缩到 1568 像素，提取文本最多 60000 字符。
+- 附件对象键带用户目录前缀；签名、删除、分析都会再次校验归属。
 - 数据库保存稳定 `object_key`，读取历史时重新生成短期 URL。
+
+Chat 回形针与知识笔记导入是两条不同业务链路：
+
+```text
+Chat 回形针：上传私有附件 -> 服务端解析/OCR -> 模型分析 -> SSE 返回
+知识笔记导入：解析文档 -> 创建 Note + Outbox -> Worker 切块/Embedding -> Qdrant
+```
+
+Chat 附件默认不会进入 Qdrant，避免临时文件未经用户确认就污染长期知识库。只有知识笔记页的“导入文档”或普通笔记保存操作才会触发向量索引。
 
 ## 12. 面试介绍
 
@@ -304,7 +338,7 @@ CRUD 层不主动提交事务；Service 决定 commit/rollback。流式问答先
 2. 再说分层：Route、Schema、Service、CRUD、Agent、Vector Store、Storage。
 3. 重点说 RAG：切块、Embedding、Qdrant、多租户过滤、Top-K、真实引用、降级与 reindex。
 4. 说 Agent：LangGraph 两节点确定性编排，流式路径复用节点能力，Service 管 SSE 生命周期。
-5. 说工程：JWT、事务边界、幂等表单、OSS 权限、短期签名 URL、统一错误响应。
+5. 说工程：JWT、事务边界、幂等表单、文档解析、OSS 权限、短期签名 URL、统一错误响应。
 6. 最后说生产：MySQL/Qdrant 持久化、迁移先行、就绪探针、非 root、Nginx HTTPS/SSE、备份监控边界。
 
 ### 常见追问
@@ -321,6 +355,8 @@ CRUD 层不主动提交事务；Service 决定 commit/rollback。流式问答先
 
 **为什么 SSE 而不是 WebSocket？** 业务主要是服务端单向增量输出；SSE 协议简单。使用 `fetch` 解析 SSE，因为请求需要 POST JSON 和 Authorization Header。
 
+**Chat 上传的文档会进入向量库吗？** 不会。Chat 附件只做当前会话分析；用户明确在知识笔记页导入后，系统才创建 Note，通过 Outbox Worker 切块、Embedding 并写入 Qdrant。
+
 **生产还缺什么？** 单机版缺跨机高可用、自动备份、WAF/限流、集中可观测性和灰度发布；README 已给出明确上线清单，避免把演示部署误称为大型生产架构。
 
 ## 13. 测试与检查
@@ -330,6 +366,30 @@ python -m compileall -q app
 python -m unittest discover -s tests -v
 alembic upgrade head
 docker compose --env-file .env.production config
+```
+
+当前单元测试共 18 项，覆盖 HTTP/SSE 合同、限流、上传大小、Outbox 原子性、Worker、向量阈值/租户过滤和本地附件签名校验；前端使用 `npm run build` 执行 TypeScript 与生产构建检查。
+
+### 量化证据
+
+可复现工具：
+
+```bash
+python deploy/load_test.py --url http://127.0.0.1:8000/health --requests 1000 --concurrency 10
+python deploy/rag_eval.py --model-path /opt/fastembed-cache/fast-bge-small-zh-v1.5 --threshold 0.55
+./deploy/ops_check.sh
+./deploy/backup.sh /opt/fieldnote/backups
+./deploy/verify_backup.sh /opt/fieldnote/backups/BACKUP_TIMESTAMP
+```
+
+腾讯云实测、阈值对比和限制说明见 [docs/evidence/README.md](docs/evidence/README.md)。当前本机 API 健康接口基线为 1000 请求/10 并发、0 错误、524.6 RPS、P95 22.5 ms；RAG 小型标注集在阈值 0.55 时 Recall@3 为 0.75、MRR 为 0.9375、无答案误引用率为 0。健康接口结果不代表模型 Chat 容量，小型评测集也不构成检索质量承诺。
+
+服务器使用 systemd timer 每日备份、每 5 分钟执行运行检查：
+
+```bash
+systemctl list-timers 'fieldnote-*'
+journalctl -u fieldnote-backup.service
+journalctl -u fieldnote-ops-check.service
 ```
 
 生产构建会下载并固化 embedding 模型，因此第一次构建较慢、镜像也会增大。若部署环境不允许构建时访问模型仓库，应在 CI 中构建并推送镜像，服务器只拉取经过验证的镜像。
@@ -343,6 +403,6 @@ docker compose --env-file .env.production config
 3. **编排持久化**：LangGraph 已有节点重试，但还没有持久化 checkpoint、人工审核和跨进程长任务恢复。复杂工具 Agent 应增加共享 checkpoint store 和 human-in-the-loop。
 4. **异步任务范围**：reindex 和笔记 embedding 已进入 Worker；文件 OCR 与视觉分析仍在 API 进程，大文件/批处理应进一步迁移到任务队列。
 5. **分布式限流与配额**：当前有应用级基础限流，但多 worker/多机下应使用 Redis 或 API Gateway 统一计算用户并发、速率和模型成本配额。
-6. **深度可观测性**：当前已有 request ID、Prometheus 请求量/延迟和访问日志；仍需 OpenTelemetry trace、模型 token/耗时、召回命中率、Qdrant 延迟、SSE 中断率和告警规则。
+6. **深度可观测性**：当前已有 request ID、Prometheus 请求量/延迟、模型 TTFT/Token、Qdrant 命中与耗时、Worker 状态 JSON 日志；仍需 OpenTelemetry trace、集中日志平台、SSE 中断指标和自动告警规则。
 7. **高可用与灾备**：已有 MySQL dump、Qdrant snapshot 脚本基线；生产仍需要异地存储、自动调度、恢复演练、托管/集群数据库、滚动发布和容量压测。
-8. **测试覆盖**：当前覆盖 HTTP/SSE 合同、基础限流、Outbox 原子提交/回滚、向量切块和租户过滤；仍需真实 MySQL/Qdrant Testcontainers、鉴权越权、Worker 崩溃恢复和端到端测试。
+8. **测试覆盖**：当前覆盖 HTTP/SSE 合同、基础限流、Outbox 原子提交/回滚、向量切块/阈值/租户过滤和本地附件签名；仍需真实 MySQL/Qdrant/OSS 集成测试、鉴权越权、Worker 崩溃恢复和端到端测试。

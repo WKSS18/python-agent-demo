@@ -1,0 +1,18 @@
+{
+  "timestamp": "2026-08-11T03:07:02.480861+00:00",
+  "url": "http://43.139.122.160/api/health",
+  "requests": 300,
+  "concurrency": 10,
+  "successes": 299,
+  "errors": 1,
+  "error_rate": 0.0033,
+  "throughput_rps": 13.49,
+  "duration_seconds": 22.239,
+  "latency_ms": {
+    "mean": 729.78,
+    "p50": 615.62,
+    "p95": 1593.46,
+    "p99": 1882.03,
+    "max": 2278.48
+  }
+}
