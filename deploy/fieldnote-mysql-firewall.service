@@ -1,0 +1,12 @@
+[Unit]
+Description=Restrict public MySQL 3306 to the approved client IP
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fieldnote/python-agent-demo/deploy/mysql-firewall.sh 139.226.12.176
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
