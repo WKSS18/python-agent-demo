@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     attachment_storage_backend: str = "auto"
     local_upload_dir: str = "/data/uploads"
     local_upload_url_prefix: str = "/api/uploads/local"
+    rabbitmq_url: str = "amqp://fieldnote:fieldnote@rabbitmq:5672/%2F"
+    rabbitmq_document_queue: str = "fieldnote.document.import"
+    rabbitmq_document_dlx: str = "fieldnote.document.dlx"
+    document_max_attempts: int = 3
+    mcp_server_url: str = "http://mcp-tools:8010/mcp"
+    mcp_timeout_seconds: float = 12.0
 
     model_config = SettingsConfigDict(
         env_file=".env",

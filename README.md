@@ -25,6 +25,7 @@
 - LangGraph 显式编排“检索知识 → 组织上下文 → 模型生成”流程。
 - LangGraph 模型节点带指数退避重试；向量候选按 75% 语义分 + 25% 关键词分混合重排。
 - SSE 逐段返回 `session/sources/delta/form/done/error` 事件。
+- Chat 额外返回 `thinking` 执行轨迹事件，前端用 Ant Design X `Think + ThoughtChain` 展示真实的意图识别、会话整理、知识检索和回答生成状态；这不是模型隐藏思维链。
 - 模型调用期间不长期占用数据库连接和事务。
 - 支持 PDF、DOCX、TXT、Markdown、CSV、图片 OCR 与视觉模型分析；知识笔记页可直接导入文档并建立向量索引。
 - 附件存储支持阿里云 OSS 和本地持久卷；对象键按用户隔离，使用短期签名 URL，长期密钥不进入浏览器。
@@ -42,6 +43,7 @@
 | 关系数据库 | SQLAlchemy 2、Alembic、MySQL/SQLite | 用户、笔记、会话、消息和事务 |
 | 向量知识库 | FastEmbed、Qdrant | 分块、Embedding、持久化和语义召回 |
 | Agent | LangGraph、Anthropic SDK | 状态图编排和模型协议适配 |
+| MCP 工具 | 官方 MCP Python SDK、Streamable HTTP | 天气、股票行情、安全计算器的发现与调用 |
 | 文件能力 | pypdf、OpenXML、Pillow、Tesseract | 文档解析、OCR 和图片分析 |
 | 附件存储 | 阿里云 OSS / Docker 持久卷 | 私有附件、签名预览、归属校验 |
 | 部署 | Docker、Compose、Nginx | 服务编排、迁移、健康检查、HTTPS/SSE 代理 |
@@ -283,7 +285,8 @@ Nginx 示例位于 `deploy/nginx.conf.example`，其中关闭了 `proxy_bufferin
 | POST | `/auth/login` | 登录并签发 JWT |
 | GET | `/users/me` | 当前用户 |
 | POST/GET | `/notes` | 创建/查询笔记 |
-| POST | `/notes/import` | 解析文档、创建笔记并异步建立向量索引 |
+| POST | `/notes/import` | 上传到 OSS，创建 RabbitMQ 异步导入任务（HTTP 202） |
+| GET | `/notes/import/tasks/{id}` | 查询文档解析任务的阶段、结果和错误 |
 | GET/PUT/DELETE | `/notes/{id}` | 笔记详情、更新、删除 |
 | POST | `/knowledge/reindex` | 重建当前用户向量索引 |
 | GET | `/knowledge/tasks/{id}` | 查询异步索引任务状态 |
@@ -398,10 +401,59 @@ journalctl -u fieldnote-ops-check.service
 
 以下项目经过审查后仍属于明确的后续工作，不应在面试中描述为已经完成：
 
-1. **消息基础设施升级**：当前已实现数据库事务 Outbox、独立 Worker、租约恢复和指数退避。多机高吞吐场景可进一步使用 CDC + Kafka/RabbitMQ、独立死信队列和任务积压告警。
+1. **消息基础设施升级**：文档导入已使用 MySQL Outbox + RabbitMQ + 独立 Worker，并具备持久消息、手动 ACK、指数退避和死信队列；多机高吞吐场景可进一步使用 CDC + Kafka、消费者水平扩展和集中告警。
 2. **检索质量评测**：目前已实现向量召回、关键词混合重排与本地降级，但还没有离线标注集、Recall@K、MRR、答案忠实度评测和 cross-encoder reranker。
 3. **编排持久化**：LangGraph 已有节点重试，但还没有持久化 checkpoint、人工审核和跨进程长任务恢复。复杂工具 Agent 应增加共享 checkpoint store 和 human-in-the-loop。
-4. **异步任务范围**：reindex 和笔记 embedding 已进入 Worker；文件 OCR 与视觉分析仍在 API 进程，大文件/批处理应进一步迁移到任务队列。
+4. **异步任务范围**：reindex、笔记 embedding 和知识文档解析/OCR 已进入 Worker；Chat 临时附件为了实时 SSE 体验仍在 API 进程，批量视觉任务可继续迁移到专用队列。
+
+## 12. RabbitMQ 文档导入（2026-08-11 已上线）
+
+知识笔记页的文档导入已经从同步请求改为异步流水线：
+
+```text
+浏览器 -> FastAPI -> OSS
+                  -> MySQL document_import_jobs（事务任务源）
+                  -> document-publisher -> RabbitMQ durable queue
+                                           -> document-worker（prefetch=1）
+                                                -> 下载 / 解析 / OCR
+                                                -> MySQL Note + knowledge Outbox
+                                                -> knowledge-worker -> FastEmbed -> Qdrant
+```
+
+- API 上传成功后返回 HTTP 202 和任务 ID；前端轮询任务状态并显示“排队、解析、创建笔记”等阶段。
+- Publisher 先从 MySQL 领取未发布任务，再用 publisher confirm 投递持久消息，避免只写队列导致业务任务丢失。
+- Consumer 使用手动 ACK、`prefetch=1` 和任务状态幂等判断。进程异常退出时消息会重新投递，但不会重复创建笔记。
+- 失败采用指数退避，最多 3 次；最终失败进入 `fieldnote.document.import.dead` 死信队列，错误摘要同时保存在 MySQL。
+- 当前 2 GB 单机没有扩容：RabbitMQ 限制 180 MB，Publisher 128 MB，Document Worker 350 MB，只运行一个消费者。
+- Chat 附件仍同步解析并 SSE 返回，因为它是用户正在等待的实时交互；RabbitMQ 只处理需要持久化、耗时可能较长的知识导入。
+
+本地启动后可通过 `docker compose logs -f document-publisher document-worker rabbitmq` 查看链路。管理界面仅监听服务器回环地址，可用 SSH 隧道访问：
+
+```bash
+ssh -L 15672:127.0.0.1:15672 ubuntu@43.139.122.160
+```
+
+然后访问 `http://127.0.0.1:15672`，用户名来自服务器 `.env.production`；不要把密码提交到仓库。
+
+## 13. MCP 工具调用（2026-08-11）
+
+Chat 已从本地关键词式“工具判断”升级为真正的 MCP Client / Server：
+
+```text
+用户问题 -> FastAPI Agent
+         -> MCP tools/list（动态发现）
+         -> 模型根据 MCP JSON Schema 选择 0 或 1 个工具
+         -> MCP tools/call（Streamable HTTP，仅容器内网）
+         -> 工具结果 + RAG 笔记 -> 模型流式回答
+```
+
+当前 MCP Server 提供三个只读工具：
+
+- `get_weather(city)`：通过 Open-Meteo 获取城市实时天气。
+- `get_stock_quote(symbol)`：查询沪深、港股、美股延迟行情，代码示例为 `sh600519`、`hk00700`、`usAAPL`。
+- `calculate(expression)`：基于受限 AST 计算，只支持数值运算，不使用 `eval`，不能执行代码。
+
+MCP Server 不映射公网端口，只允许 Compose 内的 API 容器通过 `http://mcp-tools:8010/mcp` 调用。模型只能从 Server 实际发现的白名单工具中选择；参数由 MCP Schema 校验，工具异常时 Chat 降级为普通知识问答。前端 Think 会展示工具发现、工具名称和执行状态，但不会展示密钥、完整内部响应或模型隐藏思维链。
 5. **分布式限流与配额**：当前有应用级基础限流，但多 worker/多机下应使用 Redis 或 API Gateway 统一计算用户并发、速率和模型成本配额。
 6. **深度可观测性**：当前已有 request ID、Prometheus 请求量/延迟、模型 TTFT/Token、Qdrant 命中与耗时、Worker 状态 JSON 日志；仍需 OpenTelemetry trace、集中日志平台、SSE 中断指标和自动告警规则。
 7. **高可用与灾备**：已有 MySQL dump、Qdrant snapshot 脚本基线；生产仍需要异地存储、自动调度、恢复演练、托管/集群数据库、滚动发布和容量压测。

@@ -14,7 +14,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import agent, chat_forms, crud, models, rag, schemas
+from app import agent, chat_forms, crud, mcp_client, models, rag, schemas
 from app.config import get_settings
 from app.database import SessionLocal
 from app.file_parser import ParsedFile
@@ -144,6 +144,27 @@ class KnowledgeService(BaseService):
         self.db.refresh(job)
         return job
 
+
+class DocumentImportService(BaseService):
+    """Create and expose durable document tasks consumed through RabbitMQ."""
+
+    def enqueue(
+        self, owner_id: int, object_key: str, filename: str, media_type: str, title: str,
+    ) -> models.DocumentImportJob:
+        job = crud.add_document_import_job(
+            self.db, owner_id, object_key, filename, media_type, title,
+        )
+        self._commit()
+        self.db.refresh(job)
+        logger.info("document_job_queued", extra={"event": "document_job_queued", "job_id": job.id, "owner_id": owner_id})
+        return job
+
+    def get(self, owner_id: int, job_id: int) -> models.DocumentImportJob:
+        job = crud.get_owned_document_import_job(self.db, job_id, owner_id)
+        if not job:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档导入任务不存在。")
+        return job
+
     def get_task(self, owner_id: int, task_id: int) -> models.KnowledgeIndexJob:
         job = crud.get_owned_index_job(self.db, task_id, owner_id)
         if not job:
@@ -263,9 +284,27 @@ class AgentService(BaseService):
         try:
             session_id = service._save_user_message(owner_id, data)
             yield _sse_event("session", {"session_id": session_id})
+            execution_trace: list[dict] = []
 
+            def trace(step_id: str, title: str, description: str, step_status: str) -> str:
+                step = {
+                    "id": step_id,
+                    "title": title,
+                    "description": description,
+                    "status": step_status,
+                }
+                for index, current in enumerate(execution_trace):
+                    if current["id"] == step_id:
+                        execution_trace[index] = step
+                        break
+                else:
+                    execution_trace.append(step)
+                return _sse_event("thinking", {"step": step})
+
+            yield trace("intent", "理解问题", "正在识别用户意图与回答方式", "loading")
             form = chat_forms.match_form(data.question)
             if form:
+                yield trace("intent", "理解问题", "识别为创建知识笔记请求", "success")
                 message = crud.add_agent_message(
                     db,
                     session_id=session_id,
@@ -280,8 +319,38 @@ class AgentService(BaseService):
                 yield _sse_event("done", {"message_id": message.id})
                 return
 
+            yield trace("intent", "理解问题", "已识别为知识问答请求", "success")
+            yield trace("memory", "整理会话上下文", "正在读取当前会话的相关历史消息", "loading")
             memory = service._build_memory_snapshot(session_id, data.question)
+            yield trace(
+                "memory",
+                "整理会话上下文",
+                "已准备会话上下文" if memory else "当前为独立问题，无需补充历史上下文",
+                "success",
+            )
+            tool_context = ""
+            try:
+                yield trace("mcp", "发现 MCP 工具", "正在从 Fieldnote MCP Server 获取工具清单", "loading")
+                tools = mcp_client.list_tools()
+                selected_tool = agent.select_mcp_tool(data.question, tools)
+                if selected_tool:
+                    tool_name, arguments = selected_tool
+                    yield trace("mcp", "调用 MCP 工具", f"正在调用 {tool_name}", "loading")
+                    tool_context = mcp_client.call_tool(tool_name, arguments)
+                    yield trace("mcp", "调用 MCP 工具", f"{tool_name} 已返回结果", "success")
+                else:
+                    yield trace("mcp", "发现 MCP 工具", f"已发现 {len(tools)} 个工具，本次问题无需调用", "success")
+            except Exception:
+                logger.exception("MCP tool execution failed for owner_id=%s", owner_id)
+                yield trace("mcp", "MCP 工具调用", "工具服务暂时不可用，已降级为知识问答", "error")
+            yield trace("retrieve", "检索知识笔记", "正在按当前用户范围执行语义检索与相关性过滤", "loading")
             used_notes = service._retrieve_note_snapshots(owner_id, data.question)
+            yield trace(
+                "retrieve",
+                "检索知识笔记",
+                f"找到 {len(used_notes)} 条相关笔记" if used_notes else "未找到达到相关性阈值的笔记",
+                "success",
+            )
             # 查询会自动开启事务；模型生成可能持续数分钟，先结束只读事务，
             # 将连接归还连接池，生成完成后再使用当前 Session 开启短写事务。
             db.commit()
@@ -290,17 +359,20 @@ class AgentService(BaseService):
                 {"used_notes": [note.model_dump(mode="json") for note in used_notes]},
             )
 
+            yield trace("generate", "生成回答", "正在结合问题、会话上下文和检索结果组织回答", "loading")
             answer_parts: list[str] = []
-            for text_delta in agent.stream_answer(data.question, used_notes, memory):
+            for text_delta in agent.stream_answer(data.question, used_notes, memory, tool_context):
                 answer_parts.append(text_delta)
                 yield _sse_event("delta", {"content": text_delta})
+
+            yield trace("generate", "生成回答", "回答生成完成", "success")
 
             message = crud.add_agent_message(
                 db,
                 session_id=session_id,
                 role="assistant",
                 content="".join(answer_parts),
-                message_data=_note_message_data(used_notes),
+                message_data=_note_message_data(used_notes, execution_trace),
             )
             service._commit()
             db.refresh(message)
@@ -520,6 +592,9 @@ def _sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
-def _note_message_data(used_notes: list[schemas.NoteRead]) -> dict:
+def _note_message_data(used_notes: list[schemas.NoteRead], execution_trace: list[dict] | None = None) -> dict:
     """保存回答生成时的引用快照，避免历史记录依赖当前 Note 状态。"""
-    return {"used_notes": [note.model_dump(mode="json") for note in used_notes]}
+    data = {"used_notes": [note.model_dump(mode="json") for note in used_notes]}
+    if execution_trace:
+        data["execution_trace"] = execution_trace
+    return data

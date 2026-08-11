@@ -21,7 +21,7 @@ from app.deps import get_current_user
 from app.file_parser import parse_uploaded_file, read_upload_limited
 from app.responses import register_exception_handlers, success
 from app.security import create_access_token
-from app.services import AgentService, AuthService, KnowledgeService, NoteService
+from app.services import AgentService, AuthService, DocumentImportService, KnowledgeService, NoteService
 from app.middleware import RequestMiddleware
 from app.logging_config import configure_logging
 from app.storage import OssStorage
@@ -118,27 +118,44 @@ def create_note(
     return success(NoteService(db).create(owner_id=current_user.id, data=data))
 
 
-@app.post("/notes/import", response_model=schemas.ApiResponse[schemas.NoteRead])
+@app.post(
+    "/notes/import",
+    response_model=schemas.ApiResponse[schemas.DocumentImportTaskRead],
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def import_note_document(
     file: UploadFile = File(...),
     title: str | None = Form(default=None),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
-) -> schemas.ApiResponse[schemas.NoteRead]:
-    """Parse a document into a note; NoteService then queues its vector indexing job."""
+) -> schemas.ApiResponse[schemas.DocumentImportTaskRead]:
+    """Persist a document and enqueue durable background parsing through RabbitMQ."""
     content = await read_upload_limited(file)
-    parsed = parse_uploaded_file(file.filename, file.content_type, content)
-    if not parsed.text.strip():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="文档中没有提取到可用于知识检索的文字。",
-        )
-    note_title = (title or os.path.splitext(parsed.name)[0]).strip()[:200]
-    note = NoteService(db).create(
-        owner_id=current_user.id,
-        data=schemas.NoteCreate(title=note_title or "导入的文档", content=parsed.text[:50_000]),
+    uploaded = OssStorage().upload(
+        owner_id=current_user.id, filename=file.filename,
+        media_type=file.content_type, content=content,
     )
-    return success(note, message="文档已解析为笔记，知识索引正在后台建立。")
+    note_title = (title or os.path.splitext(uploaded.name)[0]).strip()[:200] or "导入的文档"
+    try:
+        task = DocumentImportService(db).enqueue(
+            current_user.id, uploaded.object_key, uploaded.name, uploaded.media_type, note_title,
+        )
+    except Exception:
+        OssStorage().delete(current_user.id, uploaded.object_key)
+        raise
+    return success(task, message="文档已进入 RabbitMQ 后台处理队列。")
+
+
+@app.get(
+    "/notes/import/tasks/{task_id}",
+    response_model=schemas.ApiResponse[schemas.DocumentImportTaskRead],
+)
+def get_document_import_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+) -> schemas.ApiResponse[schemas.DocumentImportTaskRead]:
+    return success(DocumentImportService(db).get(current_user.id, task_id))
 
 
 @app.get("/notes", response_model=schemas.ApiResponse[list[schemas.NoteRead]])

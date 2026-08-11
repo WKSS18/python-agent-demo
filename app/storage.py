@@ -103,6 +103,19 @@ class OssStorage:
         except (oss2.exceptions.OssError, oss2.exceptions.RequestError) as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="删除 OSS 文件失败。") from exc
 
+    def download(self, owner_id: int, object_key: str) -> bytes:
+        """Read a private object for trusted background processing."""
+        self.ensure_owned(owner_id, object_key)
+        if self._use_local_storage():
+            path = self._local_path(object_key)
+            if not path.is_file():
+                raise FileNotFoundError(object_key)
+            return path.read_bytes()
+        try:
+            return self._bucket().get_object(object_key).read()
+        except (oss2.exceptions.OssError, oss2.exceptions.RequestError) as exc:
+            raise RuntimeError("附件下载失败") from exc
+
     def refresh_attachment_url(self, owner_id: int, attachment: dict | None) -> dict | None:
         """读取历史消息时重新签名，使刷新页面后私有附件仍可展示。"""
         if not isinstance(attachment, dict):

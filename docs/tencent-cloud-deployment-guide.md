@@ -556,3 +556,65 @@ MySQL 负责用户、权限、笔记和会话等强一致业务数据；Qdrant �
 
 **当前方案最大的风险是什么？**  
 单机和 2 GB 内存。机器故障会整体不可用，内存也限制并发；正式环境应升级配置并引入备份、告警和托管组件。
+
+## 15. RabbitMQ 异步文档导入增量部署（2026-08-11）
+
+本次没有扩容腾讯云服务器，而是在原 2 GB / 2 GB Swap 单机上增加 RabbitMQ。它只承接“知识笔记导入文档”，Chat 附件保持同步解析和 SSE 返回。
+
+### 15.1 为什么增加消息队列
+
+PDF、DOCX 和图片 OCR 的耗时波动较大。如果在 HTTP 请求内完成上传、解析、建笔记和向量化，浏览器容易超时，API Worker 也会被长期占用。拆成异步任务后，接口只负责可靠接收文件和创建任务，后台可以限速处理、失败重试并观察积压。
+
+RabbitMQ 不能代替 MySQL。系统先在 MySQL `document_import_jobs` 写入任务，再由 `document-publisher` 投递队列。这是简化的 Transactional Outbox：即使 RabbitMQ 短暂不可用，任务仍在数据库里，Publisher 恢复后会继续发送。
+
+### 15.2 真实处理流程
+
+```text
+1. 浏览器 POST /api/notes/import
+2. FastAPI 校验 10 MB / 文件类型，并上传阿里云 OSS
+3. 同一请求在 MySQL 创建 document_import_jobs，返回 HTTP 202 + task_id
+4. document-publisher 查询未发布任务并 confirm 投递 RabbitMQ 持久消息
+5. document-worker 手动 ACK、prefetch=1，下载 OSS 文件并解析文本/OCR
+6. 一个 MySQL 事务创建 Note、knowledge_index_jobs，并把导入任务标记 completed
+7. knowledge-worker 切块、FastEmbed 生成向量、写入 Qdrant
+8. 前端轮询 GET /notes/import/tasks/{id}，完成后刷新笔记列表
+```
+
+Consumer 通过数据库任务状态实现幂等：消息重复投递时，已完成任务直接 ACK，不会重复建笔记。临时失败会指数退避，最多 3 次；最终失败进入 `fieldnote.document.import.dead`，同时把错误摘要写入 MySQL。
+
+### 15.3 单机资源控制
+
+```yaml
+rabbitmq:          180 MB，内存水位 96 MB，磁盘保护线 512 MB
+document-publisher: 128 MB
+document-worker:    350 MB，单消费者，prefetch=1
+```
+
+上线后的实测空闲占用约为 RabbitMQ 89 MB、Publisher 46 MB、Document Worker 112 MB。它适合学习和低并发演示，不应被描述成高可用消息集群。业务量增加后，应优先使用腾讯云托管消息队列或独立节点，并增加监控、备份与多个消费者。
+
+### 15.4 本次执行命令与检查
+
+```bash
+cd /opt/fieldnote/python-agent-demo
+python3 deploy/configure_rabbitmq.py .env.production
+docker compose up -d --no-build rabbitmq migrate api knowledge-worker \
+  document-publisher document-worker
+docker compose ps
+docker compose logs -f --tail=200 rabbitmq document-publisher document-worker
+docker exec python-agent-demo-rabbitmq-1 \
+  rabbitmqctl list_queues name messages consumers
+```
+
+RabbitMQ 管理 UI 没有开放公网端口，通过本机建立 SSH 隧道：
+
+```bash
+ssh -L 15672:127.0.0.1:15672 ubuntu@43.139.122.160
+```
+
+浏览器访问 `http://127.0.0.1:15672`。用户名和密码只读服务器 `.env.production`，不写进 README、Git 或前端。
+
+部署验收使用 `deploy/smoke_document_queue.py` 创建隔离的临时用户和 Markdown 文件，完整验证 OSS -> RabbitMQ -> 解析 -> Note -> FastEmbed -> Qdrant，线上结果为 `PASS`，脚本随后删除临时用户、文件、笔记和向量。此次验收还发现并修复了 Qdrant 容器未读取同一 API Key 导致的 401 配置漂移。
+
+### 15.5 面试表达
+
+> 文档解析是典型的耗时波动任务，我把它从 FastAPI 请求线程拆到 RabbitMQ。API 先上传 OSS，并把任务可靠写进 MySQL Outbox；Publisher confirm 后发持久消息，Worker 用手动 ACK、prefetch=1、状态幂等、指数退避和 DLQ 处理。解析成功后再写知识索引 Outbox，由另一个 Worker 完成 Embedding 和 Qdrant 入库。当前是 2 GB 单机学习版，所以严格限内存和消费者数量；如果进入真实高并发生产，我会使用托管 RabbitMQ、集中监控和水平扩容消费者。

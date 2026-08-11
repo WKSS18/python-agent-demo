@@ -76,6 +76,42 @@ def get_owned_index_job(db: Session, job_id: int, owner_id: int) -> models.Knowl
     )
 
 
+def add_document_import_job(
+    db: Session, owner_id: int, object_key: str, filename: str, media_type: str, title: str,
+) -> models.DocumentImportJob:
+    job = models.DocumentImportJob(
+        owner_id=owner_id, object_key=object_key, filename=filename,
+        media_type=media_type, title=title,
+    )
+    db.add(job)
+    db.flush()
+    return job
+
+
+def get_owned_document_import_job(
+    db: Session, job_id: int, owner_id: int,
+) -> models.DocumentImportJob | None:
+    return db.scalar(select(models.DocumentImportJob).where(
+        models.DocumentImportJob.id == job_id,
+        models.DocumentImportJob.owner_id == owner_id,
+    ))
+
+
+def claim_unpublished_document_jobs(db: Session, limit: int = 10) -> list[models.DocumentImportJob]:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    return list(db.scalars(
+        select(models.DocumentImportJob)
+        .where(
+            models.DocumentImportJob.status == "queued",
+            models.DocumentImportJob.published_at.is_(None),
+            models.DocumentImportJob.available_at <= now,
+        )
+        .order_by(models.DocumentImportJob.id)
+        .limit(limit)
+        .with_for_update(skip_locked=True),
+    ))
+
+
 def recover_stale_index_jobs(db: Session, stale_minutes: int = 10) -> int:
     cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=stale_minutes)
     result = db.execute(

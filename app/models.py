@@ -103,3 +103,25 @@ class KnowledgeIndexJob(Base):
     locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class DocumentImportJob(Base):
+    """Durable document state and transactional outbox source for RabbitMQ."""
+
+    __tablename__ = "document_import_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    object_key: Mapped[str] = mapped_column(String(512), unique=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    media_type: Mapped[str] = mapped_column(String(150))
+    title: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    stage: Mapped[str] = mapped_column(String(30), default="queued")
+    note_id: Mapped[int | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

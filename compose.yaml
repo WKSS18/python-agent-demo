@@ -43,12 +43,31 @@ services:
     logging: *default-logging
     image: qdrant/qdrant:v1.18.3
     restart: unless-stopped
+    env_file:
+      - ${ENV_FILE:-.env.production}
     ports:
       - "127.0.0.1:6333:6333"
-    environment:
-      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
     volumes:
       - qdrant_data:/qdrant/storage
+
+  rabbitmq:
+    logging: *default-logging
+    image: rabbitmq:4.1-management-alpine
+    restart: unless-stopped
+    env_file:
+      - ${ENV_FILE:-.env.production}
+    ports:
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./deploy/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    mem_limit: 180m
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 8s
+      retries: 8
+      start_period: 30s
 
   api:
     logging: *default-logging
@@ -70,12 +89,31 @@ services:
         condition: service_completed_successfully
       qdrant:
         condition: service_started
+      mcp-tools:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  mcp-tools:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: ${DOCKERFILE:-Dockerfile}
+    restart: unless-stopped
+    env_file:
+      - ${ENV_FILE:-.env.production}
+    command: ["python", "-m", "app.mcp_server"]
+    mem_limit: 160m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8010), 3).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   knowledge-worker:
     logging: *default-logging
@@ -94,7 +132,44 @@ services:
       qdrant:
         condition: service_started
 
+  document-publisher:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: ${DOCKERFILE:-Dockerfile}
+    restart: unless-stopped
+    env_file:
+      - ${ENV_FILE:-.env.production}
+    command: ["python", "-m", "app.document_publisher"]
+    mem_limit: 128m
+    depends_on:
+      mysql:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  document-worker:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: ${DOCKERFILE:-Dockerfile}
+    restart: unless-stopped
+    env_file:
+      - ${ENV_FILE:-.env.production}
+    command: ["python", "-m", "app.document_worker"]
+    mem_limit: 350m
+    depends_on:
+      mysql:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
 volumes:
   mysql_data:
   qdrant_data:
   upload_data:
+  rabbitmq_data:

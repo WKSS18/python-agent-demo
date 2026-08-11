@@ -79,6 +79,20 @@ class KnowledgeIndexTaskRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class DocumentImportTaskRead(BaseModel):
+    id: int
+    filename: str
+    status: str
+    stage: str
+    note_id: int | None
+    attempts: int
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class AgentChatResponse(BaseModel):
     session_id: int
     answer: str
