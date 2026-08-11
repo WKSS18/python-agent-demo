@@ -216,6 +216,9 @@ class AgentService(BaseService):
             result.append(item)
         return result
 
+    def list_sessions(self, owner_id: int) -> list[models.AgentSession]:
+        return crud.list_agent_sessions(self.db, owner_id)
+
     def submit_note_form(
         self,
         owner_id: int,

@@ -148,6 +148,16 @@ def get_agent_session(db: Session, session_id: int) -> models.AgentSession | Non
     return db.get(models.AgentSession, session_id)
 
 
+def list_agent_sessions(db: Session, owner_id: int, limit: int = 50) -> list[models.AgentSession]:
+    query = (
+        select(models.AgentSession)
+        .where(models.AgentSession.owner_id == owner_id)
+        .order_by(models.AgentSession.id.desc())
+        .limit(limit)
+    )
+    return list(db.scalars(query))
+
+
 def get_owned_agent_message_for_update(
     db: Session,
     message_id: int,

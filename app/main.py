@@ -316,6 +316,17 @@ def read_local_attachment(
 # ------------------------------ 结构化表单与历史 ------------------------------
 
 
+@app.get(
+    "/agent/sessions",
+    response_model=schemas.ApiResponse[list[schemas.AgentSessionRead]],
+)
+def list_agent_sessions(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+) -> schemas.ApiResponse[list[schemas.AgentSessionRead]]:
+    return success(AgentService(db).list_sessions(owner_id=current_user.id))
+
+
 @app.post("/agent/forms/note", response_model=schemas.ApiResponse[schemas.NoteRead])
 def submit_agent_note_form(
     data: schemas.AgentNoteFormSubmit,

@@ -134,3 +134,16 @@ class AgentMessageRead(BaseModel):
         """SQLite 的 CURRENT_TIMESTAMP 是 UTC，但读取后不携带时区信息。"""
         utc_value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
         return utc_value.isoformat().replace("+00:00", "Z")
+
+
+class AgentSessionRead(BaseModel):
+    id: int
+    title: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, value: datetime) -> str:
+        utc_value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return utc_value.isoformat().replace("+00:00", "Z")
