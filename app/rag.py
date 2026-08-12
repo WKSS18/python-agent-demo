@@ -54,6 +54,10 @@ def retrieve_notes(
         for chunk in _chunk_note(note):
             vector_score = _cosine_similarity(query_vector, _embed(chunk))
             keyword_score = _keyword_overlap(query_tokens, _tokenize(f"{note.title} {chunk}"))
+            # The local hash vector is only a development fallback. Hash collisions
+            # are not semantic evidence, so never cite a note with zero lexical overlap.
+            if keyword_score <= 0:
+                continue
             # 关键词更精确，向量更擅长语义近似；Demo 中用固定权重表达混合检索思想。
             score = keyword_score * 0.55 + vector_score * 0.45
             if score < min_score:

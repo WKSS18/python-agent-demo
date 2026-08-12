@@ -9,6 +9,7 @@ import json
 import logging
 from collections.abc import Generator
 from datetime import UTC, datetime
+from threading import Thread
 
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
@@ -157,6 +158,16 @@ class DocumentImportService(BaseService):
         self._commit()
         self.db.refresh(job)
         logger.info("document_job_queued", extra={"event": "document_job_queued", "job_id": job.id, "owner_id": owner_id})
+        if not get_settings().is_production:
+            # Local development does not require RabbitMQ. Run the exact same worker
+            # function in a background thread; production keeps the durable queue path.
+            from app.document_worker import process_job
+            Thread(
+                target=process_job,
+                args=(job.id,),
+                name=f"document-import-{job.id}",
+                daemon=True,
+            ).start()
         return job
 
     def get(self, owner_id: int, job_id: int) -> models.DocumentImportJob:
@@ -332,6 +343,8 @@ class AgentService(BaseService):
                 "success",
             )
             tool_context = ""
+            selected_tool: tuple[str, dict] | None = None
+            tool_intent = agent.is_mcp_intent(data.question)
             try:
                 yield trace("mcp", "发现 MCP 工具", "正在从 Fieldnote MCP Server 获取工具清单", "loading")
                 tools = mcp_client.list_tools()
@@ -347,7 +360,18 @@ class AgentService(BaseService):
                 logger.exception("MCP tool execution failed for owner_id=%s", owner_id)
                 yield trace("mcp", "MCP 工具调用", "工具服务暂时不可用，已降级为知识问答", "error")
             yield trace("retrieve", "检索知识笔记", "正在按当前用户范围执行语义检索与相关性过滤", "loading")
-            used_notes = service._retrieve_note_snapshots(owner_id, data.question)
+            if tool_intent and not selected_tool and not tool_context:
+                tool_context = (
+                    "用户表达了工具使用意图，但没有提供执行所需参数。"
+                    "请提示用户补充具体城市、股票代码或计算表达式；不要声称工具不可用。"
+                )
+            # A successful real-time tool call is the answer source. Do not attach
+            # unrelated RAG candidates as citations when they were not used.
+            used_notes = (
+                []
+                if tool_intent or (selected_tool is not None and bool(tool_context))
+                else service._retrieve_note_snapshots(owner_id, data.question)
+            )
             yield trace(
                 "retrieve",
                 "检索知识笔记",

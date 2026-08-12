@@ -119,6 +119,18 @@ def select_mcp_tool(question: str, tools: list[McpTool]) -> tuple[str, dict] | N
     return None
 
 
+def is_mcp_intent(question: str) -> bool:
+    """Identify requests whose answer source should be an MCP tool, not RAG notes."""
+    lowered = question.lower()
+    if any(keyword in lowered for keyword in (
+        "天气", "气温", "温度", "股票", "股价", "行情", "计算器", "计算", "算一下",
+    )):
+        return True
+    # A standalone arithmetic expression is also an unambiguous calculator intent.
+    compact = __import__("re").sub(r"\s+", "", question)
+    return bool(compact and __import__("re").fullmatch(r"[0-9.+\-*/%()]+", compact))
+
+
 def stream_file_analysis(
     filename: str,
     extracted_text: str,
