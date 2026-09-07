@@ -22,17 +22,26 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-def get_weather(city: str) -> dict:
-    """Get current weather for a city. Use when the user asks about weather or temperature."""
+def get_weather(
+    city: str = "",
+    latitude: float | None = None,
+    longitude: float | None = None,
+) -> dict:
+    """Get current weather by city or the user's latitude and longitude."""
     with httpx.Client(timeout=8) as client:
-        place = client.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 1, "language": "zh", "format": "json"},
-        ).raise_for_status().json()
-        results = place.get("results") or []
-        if not results:
-            raise ValueError(f"找不到城市：{city}")
-        location = results[0]
+        if latitude is not None and longitude is not None:
+            location = {"name": "当前位置", "latitude": latitude, "longitude": longitude}
+        else:
+            if not city.strip():
+                raise ValueError("必须提供城市或经纬度")
+            place = client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": city, "count": 1, "language": "zh", "format": "json"},
+            ).raise_for_status().json()
+            results = place.get("results") or []
+            if not results:
+                raise ValueError(f"找不到城市：{city}")
+            location = results[0]
         forecast = client.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
@@ -42,7 +51,13 @@ def get_weather(city: str) -> dict:
                 "timezone": "auto",
             },
         ).raise_for_status().json()
-    return {"city": location["name"], "country": location.get("country"), **forecast["current"]}
+    return {
+        "city": location["name"],
+        "country": location.get("country"),
+        "latitude": location["latitude"],
+        "longitude": location["longitude"],
+        **forecast["current"],
+    }
 
 
 @mcp.tool()

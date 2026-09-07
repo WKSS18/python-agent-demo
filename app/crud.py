@@ -22,8 +22,19 @@ def add_user(db: Session, email: str, hashed_password: str) -> models.User:
     return user
 
 
-def add_note(db: Session, owner_id: int, title: str, content: str) -> models.Note:
-    note = models.Note(title=title, content=content, owner_id=owner_id)
+def add_note(
+    db: Session,
+    owner_id: int,
+    title: str,
+    content: str,
+    source_key: str | None = None,
+) -> models.Note:
+    note = models.Note(
+        title=title,
+        content=content,
+        owner_id=owner_id,
+        source_key=source_key,
+    )
     db.add(note)
     return note
 
@@ -156,6 +167,19 @@ def list_agent_sessions(db: Session, owner_id: int, limit: int = 50) -> list[mod
         .limit(limit)
     )
     return list(db.scalars(query))
+
+
+def list_notes_by_source_keys(
+    db: Session,
+    owner_id: int,
+    source_keys: list[str],
+) -> list[models.Note]:
+    if not source_keys:
+        return []
+    return list(db.scalars(select(models.Note).where(
+        models.Note.owner_id == owner_id,
+        models.Note.source_key.in_(source_keys),
+    )))
 
 
 def get_owned_agent_message_for_update(

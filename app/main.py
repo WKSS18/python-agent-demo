@@ -119,6 +119,20 @@ def create_note(
 
 
 @app.post(
+    "/notes/agent-showcase",
+    response_model=schemas.ApiResponse[schemas.AgentShowcaseImportResult],
+)
+def import_agent_showcase_notes(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+) -> schemas.ApiResponse[schemas.AgentShowcaseImportResult]:
+    """把可检索、可引用的真实项目能力说明导入当前用户知识库。"""
+    result = NoteService(db).import_agent_showcase(owner_id=current_user.id)
+    message = "Agent 项目示例笔记已导入。" if result.created_count else "Agent 项目示例笔记已存在。"
+    return success(result, message=message)
+
+
+@app.post(
     "/notes/import",
     response_model=schemas.ApiResponse[schemas.DocumentImportTaskRead],
     status_code=status.HTTP_202_ACCEPTED,
@@ -219,6 +233,19 @@ def get_knowledge_task(
     current_user: models.User = Depends(get_current_user),
 ) -> schemas.ApiResponse[schemas.KnowledgeIndexTaskRead]:
     return success(KnowledgeService(db).get_task(current_user.id, task_id))
+
+
+@app.post(
+    "/knowledge/search/diagnostics",
+    response_model=schemas.ApiResponse[schemas.KnowledgeSearchDiagnostics],
+)
+def diagnose_knowledge_search(
+    data: schemas.KnowledgeSearchRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+) -> schemas.ApiResponse[schemas.KnowledgeSearchDiagnostics]:
+    """调试混合召回、Rerank 和置信度门控；结果仍强制限定当前用户。"""
+    return success(AgentService(db).diagnose_rag(current_user.id, data.query))
 
 
 # ------------------------------ Agent 与 SSE ------------------------------

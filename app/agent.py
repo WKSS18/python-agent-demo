@@ -7,6 +7,7 @@
 
 import base64
 import logging
+import re
 import time
 from collections.abc import Callable
 from typing import Any, TypedDict
@@ -81,18 +82,33 @@ def stream_answer(
         f"notes 上下文：\n{context or '（没有检索到相关笔记，请使用模型自身知识回答）'}"
         f"\n\nMCP 工具结果：\n{tool_context or '（本次没有调用工具）'}"
     )
-    yield from _stream_model(SYSTEM_PROMPT, user_content)
+    # 微调模型只负责稳定的回答行为/格式；事实仍来自经过门控的 RAG 上下文。
+    settings = get_settings()
+    rag_model = (
+        settings.rag_fine_tuned_model
+        if used_notes and settings.rag_fine_tuned_model_enabled
+        else None
+    )
+    yield from _stream_model(SYSTEM_PROMPT, user_content, model=rag_model)
 
 
-def select_mcp_tool(question: str, tools: list[McpTool]) -> tuple[str, dict] | None:
+def select_mcp_tool(
+    question: str,
+    tools: list[McpTool],
+    latitude: float | None = None,
+    longitude: float | None = None,
+) -> tuple[str, dict] | None:
     """Let the model select at most one discovered MCP tool; never execute model text directly."""
     settings = get_settings()
     allowed = {tool.name for tool in tools}
+    weather_intent = any(keyword in question for keyword in ("天气", "气温", "温度"))
+    city = extract_weather_city(question)
+    if weather_intent and "get_weather" in allowed:
+        # 天气是高确定性意图，直接路由比依赖不同模型的 tool-use 兼容性更稳定。
+        if latitude is not None and longitude is not None:
+            return "get_weather", {"latitude": latitude, "longitude": longitude}
+        return "get_weather", {"city": city or getattr(settings, "weather_default_city", "上海")}
     if not settings.anthropic_auth_token:
-        lowered = question.lower()
-        if "天气" in question or "温度" in question:
-            city = question.split("天气", 1)[0].strip("请问查询一下 的") or "北京"
-            return ("get_weather", {"city": city}) if "get_weather" in allowed else None
         stock = __import__("re").search(r"(?i)\b(sh|sz|hk|us)[a-z0-9]{1,10}\b", question)
         if stock and "get_stock_quote" in allowed:
             return "get_stock_quote", {"symbol": stock.group(0)}
@@ -117,6 +133,29 @@ def select_mcp_tool(question: str, tools: list[McpTool]) -> tuple[str, dict] | N
         if getattr(block, "type", None) == "tool_use" and block.name in allowed:
             return block.name, dict(block.input)
     return None
+
+
+def extract_weather_city(question: str) -> str | None:
+    """从常见中文天气问法提取城市；无城市时返回 None，禁止猜测用户位置。"""
+    if not any(keyword in question for keyword in ("天气", "气温", "温度")):
+        return None
+    prefix = re.split(r"天气|气温|温度", question, maxsplit=1)[0]
+    cleaned = re.sub(
+        r"请问|麻烦|帮我|帮忙|查询一下|查一下|查询|看看|今天|今日|明天|后天|现在|当前|当地|的|怎么样|如何|情况|[，,。！？!?：:\s]",
+        "",
+        prefix,
+    )
+    cleaned = cleaned.removesuffix("市")
+    return cleaned if 1 < len(cleaned) <= 20 else None
+
+
+def mcp_clarification(question: str) -> str:
+    """对缺少必填参数的实时工具请求给出确定答复，避免模型声称工具未接入。"""
+    if any(keyword in question for keyword in ("股票", "股价", "行情")):
+        return "股票行情工具已经接入。请提供股票代码，例如：sh600519、hk00700 或 usAAPL。"
+    if any(keyword in question for keyword in ("计算器", "计算", "算一下")):
+        return "计算工具已经接入。请提供需要计算的表达式。"
+    return "请补充工具执行所需的信息。"
 
 
 def is_mcp_intent(question: str) -> bool:

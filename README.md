@@ -6,6 +6,8 @@
 
 配套前端位于 `../agent-frontfond`。
 
+面试准备可阅读 [Python Agent + RAG 项目面试实战讲解](docs/python-agent-rag-interview-guide.md)，并配合 `D:/26面试/面试整理.md` 的 247 道图解题目复习；内容结合本项目说明向量数据库选型、混合检索、Rerank、RAG Hook、微调，以及 RESTful、SSE、WebSocket 的区别与生产实践。
+
 腾讯云实际部署、故障排查和面试讲解见 [docs/tencent-cloud-deployment-guide.md](docs/tencent-cloud-deployment-guide.md)。
 
 ## 1. 项目亮点
@@ -20,6 +22,9 @@
 - 笔记事务与索引任务写入同一个 MySQL 事务；独立 `knowledge-worker` 消费 Outbox，失败指数退避并最多重试 6 次。
 - 全量 reindex 改为异步任务，接口立即返回任务 ID，可查询 pending/processing/completed/failed 状态。
 - Qdrant 暂时不可用时自动回退到本地关键词 + 哈希向量混合检索。
+- 稠密召回与 BM25 稀疏召回通过 RRF 融合，再经过可选 Hybrid/Cross-Encoder Rerank；低置信度结果不会作为引用进入模型上下文。
+- RAG Hook 提供查询规范化、候选去重和低置信度观测扩展点；诊断接口暴露各阶段分数，便于评测而不是盲调 Top-K。
+- 可配置微调回答模型，但只在可靠 RAG 上下文存在时路由；实时知识始终由 RAG 提供。
 - 向量召回应用 `0.55` 最低相关度阈值，避免 Top-K 在全部不相关时仍产生虚假引用。
 - 只将真实召回的笔记传给模型，引用来源由服务端产生并保存快照。
 - LangGraph 显式编排“检索知识 → 组织上下文 → 模型生成”流程。
@@ -138,6 +143,42 @@ START
 同步 `/agent/chat` 走完整 LangGraph 状态图。前端使用的 `/agent/chat/stream` 为了直接转发 token 增量，复用相同的检索函数与生成函数，但由 Service 控制 SSE 生命周期和消息持久化。结构化“创建笔记”意图会进入受控表单分支，不执行模型生成的任意工具调用。
 
 当前编排属于确定性工作流，而不是开放式自治 Agent。生产扩展可以增加意图路由、工具执行、审核节点、重试、checkpoint、人工确认和任务队列；面试时不要把这些后续方向说成已经实现。
+
+### 5.1 在个人知识笔记中演示 Agent 能力
+
+知识笔记页提供“Agent 项目笔记”按钮，也可以直接调用：
+
+```http
+POST /notes/agent-showcase
+Authorization: Bearer <token>
+```
+
+该操作会把 7 条项目能力说明导入当前用户自己的知识库，内容覆盖架构、RAG、短期记忆与竞态、MCP、文档入库、生产治理和真实演进边界。笔记走普通 `Note -> KnowledgeIndexJob -> Qdrant` 链路，所以可以在知识对话中被检索并作为来源引用，而不是写死在前端展示。
+
+导入使用数据库内部 `source_key` 识别来源，并由 `(owner_id, source_key)` 唯一约束防止同一用户重复创建；该字段不会出现在编辑器正文中。重复点击会复用原笔记，不覆盖用户后续修改。导入后可以直接演示：
+
+```text
+我的 Agent 项目完整请求链路是什么？
+我的项目如何保证 RAG 检索准确度？
+天气工具为什么能自动调用，MCP 安全怎么保证？
+上传一份 PDF 后是怎样进入向量库的？
+这个 Agent 项目哪些已经实现，哪些还是演进方案？
+```
+
+这组笔记的目的不是让项目“自己吹自己”，而是让面试陈述能被实际代码、知识检索和引用链验证。内容明确区分：
+
+| 能力 | 当前状态 |
+| --- | --- |
+| LangGraph 两节点图、流式受控工作流 | 已实现 |
+| Hybrid RAG、Rerank、置信度门禁、诊断 | 已实现 |
+| 最近 8 条消息短期记忆 | 已实现 |
+| MCP 工具、天气确定性路由与降级 | 已实现 |
+| AbortController + generation 竞态隔离 | 已实现 |
+| RabbitMQ 文档导入与 Qdrant Outbox | 已实现 |
+| 可选微调模型路由 | 已实现接入边界，训练流水线未实现 |
+| 长期记忆、精确 Token Budget | 演进方案 |
+| Supervisor 多 Agent | 演进方案 |
+| 多供应商 Model Gateway、自动 A/B 平台 | 演进方案 |
 
 ## 6. 本地启动
 
@@ -285,11 +326,13 @@ Nginx 示例位于 `deploy/nginx.conf.example`，其中关闭了 `proxy_bufferin
 | POST | `/auth/login` | 登录并签发 JWT |
 | GET | `/users/me` | 当前用户 |
 | POST/GET | `/notes` | 创建/查询笔记 |
+| POST | `/notes/agent-showcase` | 幂等导入 7 条可检索、可引用的真实项目能力笔记 |
 | POST | `/notes/import` | 上传到 OSS，创建 RabbitMQ 异步导入任务（HTTP 202） |
 | GET | `/notes/import/tasks/{id}` | 查询文档解析任务的阶段、结果和错误 |
 | GET/PUT/DELETE | `/notes/{id}` | 笔记详情、更新、删除 |
 | POST | `/knowledge/reindex` | 重建当前用户向量索引 |
 | GET | `/knowledge/tasks/{id}` | 查询异步索引任务状态 |
+| POST | `/knowledge/search/diagnostics` | 查看混合召回、Rerank、置信度与拒绝原因 |
 | GET | `/metrics` | Prometheus 指标（Nginx 示例限制为本机访问） |
 | POST | `/agent/chat` | LangGraph 同步问答 |
 | POST | `/agent/chat/stream` | SSE 流式 RAG 问答 |
@@ -371,7 +414,7 @@ alembic upgrade head
 docker compose --env-file .env.production config
 ```
 
-当前单元测试共 18 项，覆盖 HTTP/SSE 合同、限流、上传大小、Outbox 原子性、Worker、向量阈值/租户过滤和本地附件签名校验；前端使用 `npm run build` 执行 TypeScript 与生产构建检查。
+单元测试覆盖 HTTP/SSE 合同、限流、上传大小、Outbox 原子性、Worker、向量阈值/租户过滤、本地附件签名校验，以及 Agent 项目笔记的重复导入与用户修改保护；前端使用 `npm run build` 执行 TypeScript 与生产构建检查。
 
 ### 量化证据
 
@@ -402,7 +445,7 @@ journalctl -u fieldnote-ops-check.service
 以下项目经过审查后仍属于明确的后续工作，不应在面试中描述为已经完成：
 
 1. **消息基础设施升级**：文档导入已使用 MySQL Outbox + RabbitMQ + 独立 Worker，并具备持久消息、手动 ACK、指数退避和死信队列；多机高吞吐场景可进一步使用 CDC + Kafka、消费者水平扩展和集中告警。
-2. **检索质量评测**：目前已实现向量召回、关键词混合重排与本地降级，但还没有离线标注集、Recall@K、MRR、答案忠实度评测和 cross-encoder reranker。
+2. **检索质量评测**：已实现稠密 + BM25 + RRF、Hybrid/Cross-Encoder Rerank、置信度门控和小型 Recall@K/MRR 标注集；生产仍需扩大分业务评测集并持续评估答案忠实度与人工反馈。
 3. **编排持久化**：LangGraph 已有节点重试，但还没有持久化 checkpoint、人工审核和跨进程长任务恢复。复杂工具 Agent 应增加共享 checkpoint store 和 human-in-the-loop。
 4. **异步任务范围**：reindex、笔记 embedding 和知识文档解析/OCR 已进入 Worker；Chat 临时附件为了实时 SSE 体验仍在 API 进程，批量视觉任务可继续迁移到专用队列。
 
@@ -454,6 +497,8 @@ Chat 已从本地关键词式“工具判断”升级为真正的 MCP Client / S
 - `calculate(expression)`：基于受限 AST 计算，只支持数值运算，不使用 `eval`，不能执行代码。
 
 MCP Server 不映射公网端口，只允许 Compose 内的 API 容器通过 `http://mcp-tools:8010/mcp` 调用。模型只能从 Server 实际发现的白名单工具中选择；参数由 MCP Schema 校验，工具异常时 Chat 降级为普通知识问答。前端 Think 会展示工具发现、工具名称和执行状态，但不会展示密钥、完整内部响应或模型隐藏思维链。
+
+天气问题采用确定性工具路由：问题包含城市时直接按城市查询；只问“今天天气如何”时，Web 端优先通过浏览器 Geolocation 传递经纬度，用户拒绝定位、HTTP 页面或浏览器不支持时使用 `WEATHER_DEFAULT_CITY`（当前生产默认上海）。这样不会因为模型没有生成 tool call 而错误回答“未接入天气工具”。
 5. **分布式限流与配额**：当前有应用级基础限流，但多 worker/多机下应使用 Redis 或 API Gateway 统一计算用户并发、速率和模型成本配额。
 6. **深度可观测性**：当前已有 request ID、Prometheus 请求量/延迟、模型 TTFT/Token、Qdrant 命中与耗时、Worker 状态 JSON 日志；仍需 OpenTelemetry trace、集中日志平台、SSE 中断指标和自动告警规则。
 7. **高可用与灾备**：已有 MySQL dump、Qdrant snapshot 脚本基线；生产仍需要异地存储、自动调度、恢复演练、托管/集群数据库、滚动发布和容量压测。

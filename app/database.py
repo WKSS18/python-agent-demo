@@ -60,6 +60,6 @@ def check_dependencies() -> None:
     """Check the relational database and the enabled vector database."""
     check_database_connection()
     if settings.vector_store_enabled:
-        from app.vector_store import VectorStore
+        from app.vector_backends import create_vector_backend
 
-        VectorStore().check()
+        create_vector_backend().check()

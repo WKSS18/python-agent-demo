@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -18,6 +19,31 @@ from typing import Protocol
 VECTOR_DIMENSIONS = 256
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 80
+
+# 这些是问法噪声，不是知识主题。若把“下、介绍、怎么”拆成单字或二元组送入
+# BM25，长文档会因为偶然出现这些字而获得虚假的高词法分。
+_QUERY_FILLERS = (
+    "请帮我", "帮我", "请问", "麻烦", "介绍一下", "介绍下", "介绍",
+    "讲一下", "讲讲", "说一下", "说说", "解释一下", "解释",
+    "是什么", "有哪些", "怎么", "如何", "一下",
+)
+_TECH_ENTITY_PATTERNS: dict[str, re.Pattern[str]] = {
+    "vue": re.compile(r"(?<![a-z0-9])vue(?:\.js)?[23]?(?![a-z0-9])", re.I),
+    "react": re.compile(r"(?<![a-z0-9])react(?:\.js)?(?:1[6-9])?(?![a-z0-9])", re.I),
+    "angular": re.compile(r"(?<![a-z0-9])angular(?:js)?(?![a-z0-9])", re.I),
+    "svelte": re.compile(r"(?<![a-z0-9])svelte(?:kit)?(?![a-z0-9])", re.I),
+    "next": re.compile(r"(?<![a-z0-9])next(?:\.js)?(?![a-z0-9])", re.I),
+    "nuxt": re.compile(r"(?<![a-z0-9])nuxt(?:\.js)?(?![a-z0-9])", re.I),
+    "python": re.compile(r"(?<![a-z0-9])python(?:3)?(?![a-z0-9])", re.I),
+    "javascript": re.compile(r"(?<![a-z0-9])(?:javascript|js)(?![a-z0-9])", re.I),
+    "typescript": re.compile(r"(?<![a-z0-9])(?:typescript|ts)(?![a-z0-9])", re.I),
+    "fastapi": re.compile(r"(?<![a-z0-9])fastapi(?![a-z0-9])", re.I),
+    "django": re.compile(r"(?<![a-z0-9])django(?![a-z0-9])", re.I),
+    "node": re.compile(r"(?<![a-z0-9])node(?:\.js)?(?![a-z0-9])", re.I),
+    "vite": re.compile(r"(?<![a-z0-9])vite(?![a-z0-9])", re.I),
+    "webpack": re.compile(r"(?<![a-z0-9])webpack(?![a-z0-9])", re.I),
+    "electron": re.compile(r"(?<![a-z0-9])electron(?![a-z0-9])", re.I),
+}
 
 
 class NoteLike(Protocol):
@@ -91,11 +117,28 @@ def _chunk_note(note: NoteLike) -> list[str]:
 
 
 def _tokenize(text: str) -> list[str]:
-    """兼容中英文的轻量分词：英文按词，中文补充二字窗口。"""
+    """兼容中英文技术语料的轻量分词，过滤问法噪声且不保留中文单字。"""
     lowered = text.lower()
-    tokens = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]", lowered)
-    chinese_chars = [token for token in tokens if len(token) == 1 and "\u4e00" <= token <= "\u9fff"]
-    tokens.extend("".join(pair) for pair in zip(chinese_chars, chinese_chars[1:], strict=False))
+    for filler in _QUERY_FILLERS:
+        lowered = lowered.replace(filler, " ")
+
+    tokens = re.findall(r"[a-z][a-z0-9_.+#-]*|[0-9]+", lowered)
+    # Vue3 / Vue 3 都补充 vue 词项，兼容常见技术名的连写与分写。
+    for token in list(tokens):
+        family = re.fullmatch(r"(vue|react)(?:\.js)?(?:[0-9]+)?", token)
+        if family and family.group(1) != token:
+            tokens.append(family.group(1))
+
+    for span in re.findall(r"[\u4e00-\u9fff]+", lowered):
+        if len(span) == 1:
+            tokens.append(span)
+            continue
+        # 二/三字窗口兼顾中文召回率；不再保留单字，避免“下、有、的”等碰撞。
+        tokens.extend(span[index:index + 2] for index in range(len(span) - 1))
+        if len(span) >= 3:
+            tokens.extend(span[index:index + 3] for index in range(len(span) - 2))
+        if len(span) <= 8:
+            tokens.append(span)
     return tokens
 
 
@@ -128,3 +171,46 @@ def _keyword_overlap(query_tokens: list[str], document_tokens: list[str]) -> flo
 def keyword_score(query: str, document: str) -> float:
     """Public lexical score used to rerank vector candidates."""
     return _keyword_overlap(_tokenize(query), _tokenize(document))
+
+
+def entity_compatible(query: str, document: str) -> bool:
+    """阻止同领域但对象冲突的技术框架被当作答案证据。
+
+    例如询问 Vue 时，只有 React 且完全未出现 Vue 的笔记可用于候选诊断，
+    但不能进入引用；同时包含 Vue/React 的对比资料仍然允许通过。
+    """
+    query_entities = {
+        name for name, pattern in _TECH_ENTITY_PATTERNS.items() if pattern.search(query)
+    }
+    if not query_entities:
+        return True
+    document_entities = {
+        name for name, pattern in _TECH_ENTITY_PATTERNS.items() if pattern.search(document)
+    }
+    # 明确点名技术对象时宁可不引用，也不允许一条未出现该对象的内容仅凭
+    # 高 Dense 分通过；标题也包含在 document 中，因此正常专题笔记不会受影响。
+    return bool(query_entities & document_entities)
+
+
+def bm25_scores(query: str, documents: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
+    """计算轻量 BM25 稀疏检索分数。
+
+    不依赖外部搜索引擎，便于本地运行；生产规模扩大后可替换为 Elasticsearch/
+    OpenSearch 的倒排索引，Pipeline 接口保持不变。
+    """
+    if not documents:
+        return []
+    query_terms = list(dict.fromkeys(_tokenize(query)))
+    tokenized = [_tokenize(document) for document in documents]
+    average_length = sum(len(tokens) for tokens in tokenized) / max(len(tokenized), 1)
+    scores = [0.0] * len(documents)
+    for term in query_terms:
+        document_frequency = sum(term in tokens for tokens in tokenized)
+        inverse_frequency = math.log(1 + (len(documents) - document_frequency + 0.5) / (document_frequency + 0.5))
+        for index, tokens in enumerate(tokenized):
+            frequency = Counter(tokens)[term]
+            if not frequency:
+                continue
+            length_normalizer = 1 - b + b * len(tokens) / max(average_length, 1)
+            scores[index] += inverse_frequency * (frequency * (k1 + 1)) / (frequency + k1 * length_normalizer)
+    return scores

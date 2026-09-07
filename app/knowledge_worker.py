@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from app import crud, models
 from app.config import get_settings
 from app.database import SessionLocal
-from app.vector_store import VectorStore
+from app.vector_backends import create_vector_backend
 
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ def _process_job(job_id: int) -> None:
 
     error: Exception | None = None
     try:
-        store = VectorStore()
+        store = create_vector_backend()
         if operation == "upsert" and note_id is not None:
             if note_rows:
                 store.index_note(*note_rows[0])

@@ -65,6 +65,8 @@ class NoteRead(BaseModel):
 class AgentChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=10_000)
     session_id: int | None = None
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
 
 
 class KnowledgeIndexTaskRead(BaseModel):
@@ -77,6 +79,43 @@ class KnowledgeIndexTaskRead(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AgentShowcaseImportResult(BaseModel):
+    """可选导入当前用户知识库的项目能力笔记。"""
+
+    version: str
+    created_count: int
+    reused_count: int
+    notes: list[NoteRead]
+    suggested_questions: list[str]
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=2_000)
+
+
+class KnowledgeSearchHit(BaseModel):
+    note_id: int
+    title: str
+    chunk: str
+    dense_score: float
+    sparse_score: float
+    fusion_score: float
+    rerank_score: float
+    evidence_score: float = 0.0
+    source_trust: float = 0.0
+    citable: bool = False
+    retrieval_sources: list[str]
+
+
+class KnowledgeSearchDiagnostics(BaseModel):
+    normalized_query: str
+    accepted: bool
+    confidence: float
+    reason: str
+    confidence_components: dict[str, float] = Field(default_factory=dict)
+    hits: list[KnowledgeSearchHit]
 
 
 class DocumentImportTaskRead(BaseModel):

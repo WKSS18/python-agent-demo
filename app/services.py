@@ -16,12 +16,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import agent, chat_forms, crud, mcp_client, models, rag, schemas
+from app.agent_showcase import SHOWCASE_NOTES, SHOWCASE_VERSION
 from app.config import get_settings
 from app.database import SessionLocal
 from app.file_parser import ParsedFile
 from app.security import hash_password, verify_password
 from app.storage import OssStorage
-from app.vector_store import VectorStore
+from app.rag_pipeline import RagOutcome, RagPipeline
+from app.vector_backends import create_vector_backend
+from app.vector_store import VectorHit
 
 
 logger = logging.getLogger(__name__)
@@ -128,6 +131,49 @@ class NoteService(BaseService):
         logger.info(
             "note_deleted",
             extra={"event": "note_deleted", "owner_id": owner_id, "note_id": note_id},
+        )
+
+    def import_agent_showcase(self, owner_id: int) -> schemas.AgentShowcaseImportResult:
+        """导入真实项目能力笔记；再次调用复用原笔记且不覆盖用户修改。"""
+        source_keys = [item.source_key for item in SHOWCASE_NOTES]
+        existing = crud.list_notes_by_source_keys(self.db, owner_id, source_keys)
+        by_source_key = {note.source_key: note for note in existing}
+        created: list[models.Note] = []
+        selected: list[models.Note] = []
+        for item in SHOWCASE_NOTES:
+            note = by_source_key.get(item.source_key)
+            if note is None:
+                note = crud.add_note(
+                    self.db,
+                    owner_id=owner_id,
+                    title=item.title,
+                    content=item.content,
+                    source_key=item.source_key,
+                )
+                self.db.flush()
+                if get_settings().vector_store_enabled:
+                    crud.add_index_job(self.db, "upsert", owner_id, note_id=note.id)
+                created.append(note)
+            selected.append(note)
+
+        self._commit()
+        for note in created:
+            self.db.refresh(note)
+        logger.info(
+            "agent_showcase_imported",
+            extra={
+                "event": "agent_showcase_imported",
+                "owner_id": owner_id,
+                "version": SHOWCASE_VERSION,
+                "created_count": len(created),
+            },
+        )
+        return schemas.AgentShowcaseImportResult(
+            version=SHOWCASE_VERSION,
+            created_count=len(created),
+            reused_count=len(selected) - len(created),
+            notes=[schemas.NoteRead.model_validate(note) for note in selected],
+            suggested_questions=[item.suggested_question for item in SHOWCASE_NOTES],
         )
 
 
@@ -343,12 +389,18 @@ class AgentService(BaseService):
                 "success",
             )
             tool_context = ""
+            direct_answer = ""
             selected_tool: tuple[str, dict] | None = None
             tool_intent = agent.is_mcp_intent(data.question)
             try:
                 yield trace("mcp", "发现 MCP 工具", "正在从 Fieldnote MCP Server 获取工具清单", "loading")
                 tools = mcp_client.list_tools()
-                selected_tool = agent.select_mcp_tool(data.question, tools)
+                selected_tool = agent.select_mcp_tool(
+                    data.question,
+                    tools,
+                    latitude=data.latitude,
+                    longitude=data.longitude,
+                )
                 if selected_tool:
                     tool_name, arguments = selected_tool
                     yield trace("mcp", "调用 MCP 工具", f"正在调用 {tool_name}", "loading")
@@ -361,10 +413,7 @@ class AgentService(BaseService):
                 yield trace("mcp", "MCP 工具调用", "工具服务暂时不可用，已降级为知识问答", "error")
             yield trace("retrieve", "检索知识笔记", "正在按当前用户范围执行语义检索与相关性过滤", "loading")
             if tool_intent and not selected_tool and not tool_context:
-                tool_context = (
-                    "用户表达了工具使用意图，但没有提供执行所需参数。"
-                    "请提示用户补充具体城市、股票代码或计算表达式；不要声称工具不可用。"
-                )
+                direct_answer = agent.mcp_clarification(data.question)
             # A successful real-time tool call is the answer source. Do not attach
             # unrelated RAG candidates as citations when they were not used.
             used_notes = (
@@ -388,7 +437,12 @@ class AgentService(BaseService):
 
             yield trace("generate", "生成回答", "正在结合问题、会话上下文和检索结果组织回答", "loading")
             answer_parts: list[str] = []
-            for text_delta in agent.stream_answer(data.question, used_notes, memory, tool_context):
+            answer_stream = (
+                iter((direct_answer,))
+                if direct_answer
+                else agent.stream_answer(data.question, used_notes, memory, tool_context)
+            )
+            for text_delta in answer_stream:
                 answer_parts.append(text_delta)
                 yield _sse_event("delta", {"content": text_delta})
 
@@ -538,55 +592,56 @@ class AgentService(BaseService):
             raise
 
     def _retrieve_note_snapshots(self, owner_id: int, question: str) -> list[schemas.NoteRead]:
-        """用混合 RAG 召回当前用户笔记；无命中时让模型用自身知识回答。"""
-        all_notes = crud.list_notes(self.db, owner_id=owner_id)
-        settings = get_settings()
-        snapshots: list[schemas.NoteRead]
-        if settings.vector_store_enabled:
-            try:
-                hits = VectorStore().search(owner_id, question, settings.rag_candidate_limit)
-                note_ids = list(dict.fromkeys(hit.note_id for hit in hits))
-                selected_notes = crud.list_owned_notes_by_ids(self.db, owner_id, note_ids)
-                best_chunks: dict[int, str] = {}
-                vector_scores: dict[int, float] = {}
-                for hit in hits:
-                    best_chunks.setdefault(hit.note_id, hit.chunk)
-                    vector_scores.setdefault(hit.note_id, hit.score)
-                selected_notes.sort(
-                    key=lambda note: (
-                        vector_scores.get(note.id, 0.0) * 0.75
-                        + rag.keyword_score(question, f"{note.title} {best_chunks.get(note.id, '')}") * 0.25
-                    ),
-                    reverse=True,
-                )
-                selected_notes = selected_notes[:settings.rag_top_k]
-                snapshots = [
-                    schemas.NoteRead.model_validate(note).model_copy(
-                        update={"content": best_chunks.get(note.id, note.content[:500])},
-                    )
-                    for note in selected_notes
-                ]
-            except Exception:
-                logger.exception("Vector search failed; falling back to local hybrid retrieval")
-                retrieved_notes = rag.retrieve_notes(question, all_notes, limit=settings.rag_top_k)
-                snapshots = [
-                    schemas.NoteRead.model_validate(item.note).model_copy(
-                        update={"content": item.matched_chunk},
-                    )
-                    for item in retrieved_notes
-                ]
-        else:
-            retrieved_notes = rag.retrieve_notes(question, all_notes, limit=settings.rag_top_k)
-            snapshots = [
-                schemas.NoteRead.model_validate(item.note).model_copy(
-                    update={"content": item.matched_chunk},
-                )
-                for item in retrieved_notes
-            ]
-
+        """执行混合召回、二阶段排序和置信度门控；低置信度时不返回引用。"""
+        outcome = self._run_rag_pipeline(owner_id, question)
+        snapshots = [] if not outcome.accepted else [
+            schemas.NoteRead.model_validate(item.note).model_copy(update={"content": item.chunk})
+            for item in outcome.evidence[:get_settings().rag_top_k]
+        ]
         # 转成 DTO 后结束读事务，避免慢速模型调用长期占用数据库连接和事务。
         self.db.rollback()
         return snapshots
+
+    def diagnose_rag(self, owner_id: int, query: str) -> schemas.KnowledgeSearchDiagnostics:
+        """返回当前用户范围内的可解释检索分数，不暴露其他租户数据。"""
+        outcome = self._run_rag_pipeline(owner_id, query)
+        result = schemas.KnowledgeSearchDiagnostics(
+            normalized_query=outcome.query,
+            accepted=outcome.accepted,
+            confidence=round(outcome.confidence, 6),
+            reason=outcome.reason,
+            confidence_components={
+                key: round(value, 6) for key, value in outcome.confidence_components.items()
+            },
+            hits=[schemas.KnowledgeSearchHit(
+                note_id=item.note.id, title=item.note.title, chunk=item.chunk,
+                dense_score=round(item.dense_score, 6), sparse_score=round(item.sparse_score, 6),
+                fusion_score=round(item.fusion_score, 6), rerank_score=round(item.rerank_score, 6),
+                evidence_score=round(item.evidence_score, 6),
+                source_trust=round(item.source_trust, 6),
+                citable=any(evidence.note.id == item.note.id for evidence in outcome.evidence),
+                retrieval_sources=list(item.retrieval_sources),
+            ) for item in outcome.candidates],
+        )
+        self.db.rollback()
+        return result
+
+    def _run_rag_pipeline(self, owner_id: int, question: str) -> RagOutcome:
+        all_notes = crud.list_notes(self.db, owner_id=owner_id)
+        settings = get_settings()
+        hits: list[VectorHit] = []
+        if settings.vector_store_enabled:
+            try:
+                hits = create_vector_backend().search(owner_id, question, settings.rag_candidate_limit)
+            except Exception:
+                logger.exception("Vector search failed; falling back to local hybrid retrieval")
+        if not hits:
+            retrieved_notes = rag.retrieve_notes(question, all_notes, limit=settings.rag_top_k)
+            hits = [
+                VectorHit(note_id=item.note.id, chunk=item.matched_chunk, score=max(0.0, item.vector_score))
+                for item in retrieved_notes
+            ]
+        return RagPipeline().run(owner_id, question, all_notes, hits)
 
     def _build_memory_snapshot(self, session_id: int, current_question: str) -> str:
         """取最近对话作为短期记忆，并避免把当前问题重复塞进 prompt。"""

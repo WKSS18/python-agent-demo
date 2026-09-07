@@ -62,10 +62,10 @@ class KnowledgeOutboxTests(unittest.TestCase):
 
         with (
             patch("app.knowledge_worker.SessionLocal", session_factory),
-            patch("app.knowledge_worker.VectorStore") as store_type,
+            patch("app.knowledge_worker.create_vector_backend") as backend_factory,
         ):
             _process_job(job_id)
-            store_type.return_value.index_note.assert_called_once()
+            backend_factory.return_value.index_note.assert_called_once()
 
         with Session(self.engine) as db:
             completed = db.get(models.KnowledgeIndexJob, job_id)
