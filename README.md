@@ -14,21 +14,21 @@
 
 - JWT 登录认证；密码只保存 bcrypt 哈希。
 - Service 层统一处理权限、幂等、事务和跨模块流程。
-- 笔记按 500 字符、80 字符重叠窗口切块。
+- 笔记按标题/段落优先切块；超长段落使用约 700 字窗口、120 字 overlap，并保存 chunk_id、标题路径和字符数元数据。
 - FastEmbed 使用 `BAAI/bge-small-zh-v1.5` 生成中文语义向量。
 - Qdrant 持久化分块向量，并用 `owner_id` payload filter 保证多租户隔离。
 - Qdrant 为 `owner_id`、`note_id` 建立 payload index，避免数据量增长后过滤退化为全量扫描。
 - 笔记新增、更新、删除后同步维护向量索引；支持一键全量重建。
 - 笔记事务与索引任务写入同一个 MySQL 事务；独立 `knowledge-worker` 消费 Outbox，失败指数退避并最多重试 6 次。
 - 全量 reindex 改为异步任务，接口立即返回任务 ID，可查询 pending/processing/completed/failed 状态。
-- Qdrant 暂时不可用时自动回退到本地关键词 + 哈希向量混合检索。
+- 本地开发可启用关键词 + 哈希向量兼容模式；生产环境强制真实 FastEmbed + Qdrant，向量服务无证据时 abstain，不把模拟向量当作业务引用。
 - 稠密召回与 BM25 稀疏召回通过 RRF 融合，再经过可选 Hybrid/Cross-Encoder Rerank；低置信度结果不会作为引用进入模型上下文。
 - RAG Hook 提供查询规范化、候选去重和低置信度观测扩展点；诊断接口暴露各阶段分数，便于评测而不是盲调 Top-K。
 - 可配置微调回答模型，但只在可靠 RAG 上下文存在时路由；实时知识始终由 RAG 提供。
 - 向量召回应用 `0.55` 最低相关度阈值，避免 Top-K 在全部不相关时仍产生虚假引用。
 - 只将真实召回的笔记传给模型，引用来源由服务端产生并保存快照。
 - LangGraph 显式编排“检索知识 → 组织上下文 → 模型生成”流程。
-- LangGraph 模型节点带指数退避重试；向量候选按 75% 语义分 + 25% 关键词分混合重排。
+- LangGraph 模型节点带指数退避重试；召回阶段使用 Dense + BM25 + RRF，随后进行 Hybrid/Cross-Encoder rerank 和绝对证据门控。
 - SSE 逐段返回 `session/sources/delta/form/done/error` 事件。
 - Chat 额外返回 `thinking` 执行轨迹事件，前端用 Ant Design X `Think + ThoughtChain` 展示真实的意图识别、会话整理、知识检索和回答生成状态；这不是模型隐藏思维链。
 - 模型调用期间不长期占用数据库连接和事务。
@@ -38,6 +38,7 @@
 - `/health` 用于存活检查，`/ready` 同时检查 MySQL 与已启用的 Qdrant。
 - 每个响应携带 `X-Request-ID`，提供 Prometheus `/metrics`、路由级基础限流，以及 API/RAG/模型/Worker JSON 日志和 Docker 日志轮转。
 - 笔记、问题和上传文件均有服务端硬限制，上传采用分块读取，在超过 10 MB 时提前终止。
+- 智能笔记复盘：按用户/笔记/日期幂等生成摘要、关键点、自测题和待办，并持久化为 `note_reviews`。
 
 ## 2. 技术栈
 
@@ -99,7 +100,7 @@ app/logging_config.py JSON 日志格式与请求关联上下文
   -> MySQL 写入业务数据
   -> 同一 MySQL 事务写入 knowledge_index_jobs Outbox
   -> 提交事务
-  -> 标题 + 正文切块（500，overlap 80）
+  -> 标题/段落优先切块（约 700，overlap 120）
   -> FastEmbed 生成中文语义向量
   -> knowledge-worker 领取任务
   -> FastEmbed + Qdrant upsert
@@ -127,7 +128,7 @@ app/logging_config.py JSON 日志格式与请求关联上下文
 
 ### 4.3 降级策略
 
-本地开发默认 `VECTOR_STORE_ENABLED=false`，使用关键词重叠 + 本地哈希向量检索，方便零依赖启动。生产默认启用 Qdrant。Qdrant 请求失败时会记录完整服务端日志并回退本地检索，聊天功能仍可用，但召回质量与性能会下降。
+本地开发默认 `VECTOR_STORE_ENABLED=false`，使用关键词重叠 + 本地哈希向量检索，方便零依赖启动。生产默认启用 Qdrant，并要求 `ALLOW_MOCK_MODEL=false`、`ALLOW_LEGACY_RAG_FALLBACK=false`。Qdrant 无结果时返回低置信度，不生成虚假引用。
 
 ## 5. Agent 编排是否完整
 
@@ -506,3 +507,75 @@ MCP Server 不映射公网端口，只允许 Compose 内的 API 容器通过 `ht
 6. **深度可观测性**：当前已有 request ID、Prometheus 请求量/延迟、模型 TTFT/Token、Qdrant 命中与耗时、Worker 状态 JSON 日志；仍需 OpenTelemetry trace、集中日志平台、SSE 中断指标和自动告警规则。
 7. **高可用与灾备**：已有 MySQL dump、Qdrant snapshot 脚本基线；生产仍需要异地存储、自动调度、恢复演练、托管/集群数据库、滚动发布和容量压测。
 8. **测试覆盖**：当前覆盖 HTTP/SSE 合同、基础限流、Outbox 原子提交/回滚、向量切块/阈值/租户过滤和本地附件签名；仍需真实 MySQL/Qdrant/OSS 集成测试、鉴权越权、Worker 崩溃恢复和端到端测试。
+
+## 15. 面试版项目总结
+
+### 整体介绍
+
+Fieldnote 是一个面向个人知识管理的 AI Agent。用户可以创建笔记或上传 PDF、Word、Markdown、图片等资料，系统异步解析并建立向量索引；聊天时在当前用户范围内进行 Dense + BM25 混合检索、Rerank 和置信度门控，再由模型流式生成带真实引用的答案。项目同时提供智能笔记复盘：为指定笔记生成摘要、关键点、自测题和待办，并按用户、笔记和日期幂等保存。
+
+### 技术功能
+
+- FastAPI REST API、JWT 鉴权、Pydantic 合同和统一错误响应。
+- MySQL 保存用户、笔记、会话、消息、导入任务和复盘结果。
+- OSS 私有附件、短期签名 URL、PDF/DOCX/文本解析、OCR 和视觉模型分析。
+- MySQL Outbox + RabbitMQ + Document Worker + Knowledge Worker 的异步导入与向量化。
+- FastEmbed 生成真实向量，Qdrant 保存 chunk，并按 `owner_id` 做强过滤。
+- BM25、Dense、RRF、Hybrid/Cross-Encoder Rerank、证据分数和拒答门控。
+- LangGraph 检索-生成编排、Anthropic Messages 兼容模型、SSE 增量输出。
+- MCP 动态工具发现和受限天气、行情、计算器工具调用。
+- Prometheus 指标、结构化日志、健康检查、备份和 Docker Compose 部署。
+
+### 项目亮点
+
+1. **真实异步一致性链路**：业务数据和 Outbox 同事务，消息确认、手动 ACK、租约回收、重试和死信保证任务可靠。
+2. **多租户安全**：SQL、Qdrant payload、回表校验三层使用 `owner_id`，模型只接收当前用户证据。
+3. **RAG 可信引用**：不把 Top-K 当作事实，通过绝对证据、词法/语义门槛和分数 margin 决定是否引用。
+4. **笔记复盘闭环**：从“存笔记、问问题”扩展到“总结、复习、行动”，功能和个人知识管理强相关。
+5. **生产边界清晰**：本地可使用兼容降级，生产强制真实模型和持久化向量库，不把 Demo 能力包装成生产能力。
+
+### 技术难点
+
+- 文档格式不固定时，如何按标题、段落、页面和 overlap 切出可检索 chunk。
+- Qdrant 最终一致时，如何保证 MySQL 是真实数据源并支持失败重试和重建。
+- Dense、BM25、Rerank 分数尺度不同，如何用 RRF 和绝对证据门控避免误引用。
+- SSE 模型请求可能持续很久，如何拆分数据库读事务和写事务，避免连接池耗尽。
+- 用户笔记是不可信数据，如何防止 Prompt Injection 影响系统规则和工具调用。
+- 模型返回 JSON 可能不稳定，复盘功能如何做格式约束、解析失败处理和幂等保存。
+
+### 高频面试问题
+
+**为什么 MySQL 和 Qdrant 分开？** MySQL 负责强一致业务数据，Qdrant 负责高维向量检索；通过 Outbox 最终一致，职责清晰且便于独立扩展。
+
+**为什么需要 BM25？** 向量适合同义表达，BM25 对错误码、版本号、类名和技术关键词更准确，两者互补。
+
+**切片参数如何确定？** 先按标题/段落保留语义边界，再用 500～800 字窗口和 80～120 字 overlap；最终用标注集比较 Recall@K、MRR、Precision@K 和误引用率。
+
+**没有召回结果怎么办？** 进入低置信度流程，回答可以说明知识库没有足够证据，不能把最相近的弱候选强行作为引用。
+
+**如何保证向量检索不越权？** 查询 filter 强制 owner_id，召回结果回 MySQL 再校验 owner_id，接口本身不接受可替代当前用户的 owner_id 参数。
+
+**为什么使用 Outbox？** 直接先写数据库再发消息会产生双写不一致；Outbox 把业务数据和待投递任务放入同一事务，由 Publisher 异步可靠投递。
+
+**为什么用 SSE？** 普通聊天是服务端单向流式文本，SSE 协议简单、浏览器支持好；双人语音复盘使用独立 WebRTC 音频链路，WebSocket 只负责信令。
+
+**项目目前还缺什么？** 大规模真实标注集、集中式限流、OpenTelemetry、多 AZ 高可用、真实 MySQL/Qdrant/OSS 集成压测和更复杂的 LangGraph checkpoint 仍是后续方向。
+
+### 客户端扩展归档
+
+WebRTC、Electron 和 React Native 的接口边界、实施顺序与安全注意事项见
+[docs/client-platform-roadmap.md](docs/client-platform-roadmap.md)。当前优先完成 Web 端录音/上传和笔记复盘闭环，再按真实需求引入实时媒体服务器、桌面端离线同步或移动端原生能力。
+
+### WebRTC 笔记语音复盘（已实现）
+
+当前已实现最小双人语音复盘房：用户在一篇笔记上创建房间，另一位用户通过邀请链接加入，浏览器使用 `getUserMedia` 和 `RTCPeerConnection` 建立 P2P 音频连接，FastAPI WebSocket 只转发 `offer/answer/ice-candidate` 信令。
+
+```text
+POST /api/notes/{note_id}/voice-room
+WebSocket /api/voice-rooms/{room_id}/signal?token=<access_token>
+```
+
+第一版限制为单笔记、最多两人、纯音频、内存房间和公共 STUN，不需要购买第三方服务；房间重启后失效。公网浏览器正式使用麦克风需要 HTTPS，当前 HTTP IP 地址仅适合接口验证，后续可增加域名证书、TURN 中继、录音转写和 AI 复盘。
+
+本地联调时 Vite 已开启 WebSocket 代理（`ws: true`），否则只能创建房间但信令无法建立。邀请链接标准格式为
+`/?voice_room=<room_id>`，也兼容历史的 `/voice_room=<room_id>` 格式。创建者需要保持房间页面打开，加入者使用不同账号打开链接；房间卡片会同步参与者名称和连接状态。

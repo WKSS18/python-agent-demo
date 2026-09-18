@@ -5,7 +5,7 @@
 函数短小且容易从 Swagger 理解。
 """
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.responses import Response, StreamingResponse
 import os
@@ -16,15 +16,17 @@ from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.config import get_settings
-from app.database import check_dependencies, get_db
+from app.database import SessionLocal, check_dependencies, get_db
 from app.deps import get_current_user
 from app.file_parser import parse_uploaded_file, read_upload_limited
 from app.responses import register_exception_handlers, success
 from app.security import create_access_token
-from app.services import AgentService, AuthService, DocumentImportService, KnowledgeService, NoteService
+from app.services import AgentService, AuthService, DocumentImportService, KnowledgeService, NoteReviewService, NoteService
 from app.middleware import RequestMiddleware
 from app.logging_config import configure_logging
 from app.storage import OssStorage
+from app.security import decode_access_token
+from app.voice_rooms import ROOMS, broadcast, create_room, get_room
 
 
 configure_logging()
@@ -208,6 +210,58 @@ def delete_note(
 ) -> schemas.ApiResponse[None]:
     NoteService(db).delete(owner_id=current_user.id, note_id=note_id)
     return success(message="删除成功")
+
+
+@app.post("/notes/{note_id}/review", response_model=schemas.ApiResponse[schemas.NoteReviewRead])
+def review_note(
+    note_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+) -> schemas.ApiResponse[schemas.NoteReviewRead]:
+    """生成当天笔记复盘；重复请求返回同一份快照。"""
+    return success(NoteReviewService(db).create_or_get(current_user.id, note_id))
+
+
+@app.post("/notes/{note_id}/voice-room", response_model=schemas.ApiResponse[schemas.VoiceRoomRead])
+def create_voice_room(
+    note_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+) -> schemas.ApiResponse[schemas.VoiceRoomRead]:
+    note = NoteService(db).get(current_user.id, note_id)
+    room = create_room(current_user.id, note.id)
+    return success(schemas.VoiceRoomRead(room_id=room.room_id, note_id=room.note_id, expires_at=room.expires_at))
+
+
+@app.websocket("/voice-rooms/{room_id}/signal")
+async def voice_room_signal(websocket: WebSocket, room_id: str, token: str = Query(default="")) -> None:
+    user_id = decode_access_token(token)
+    room = get_room(room_id)
+    if not user_id or not room or len(room.peers) >= 2 or int(user_id) in room.peers:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    peer_id = int(user_id)
+    with SessionLocal() as db:
+        user = db.get(models.User, peer_id)
+        display_name = (user.email.split("@", 1)[0] if user and user.email else f"用户{peer_id}")
+    room.peers[peer_id] = websocket
+    room.peer_names[peer_id] = display_name
+    participants = [{"user_id": uid, "name": room.peer_names.get(uid, f"用户{uid}")} for uid in room.peers]
+    ready = {"type": "room-ready", "peer_count": len(room.peers), "participants": participants}
+    await websocket.send_json(ready)
+    # 通知已经在房间内的另一端：第二位参与者已加入，可以开始 offer。
+    await broadcast(room, peer_id, ready)
+    try:
+        while True:
+            payload = await websocket.receive_json()
+            if isinstance(payload, dict) and payload.get("type") in {"offer", "answer", "ice-candidate", "peer-ready", "hangup"}:
+                await broadcast(room, peer_id, payload)
+    except WebSocketDisconnect:
+        room.peers.pop(peer_id, None)
+        room.peer_names.pop(peer_id, None)
+        if not room.peers:
+            ROOMS.pop(room_id, None)
 
 
 @app.post(

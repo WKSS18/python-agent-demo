@@ -81,6 +81,25 @@ class KnowledgeIndexTaskRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class NoteReviewRead(BaseModel):
+    id: int
+    note_id: int
+    review_date: str
+    summary: str
+    key_points: list[str]
+    questions: list[str]
+    todo_items: list[str]
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class VoiceRoomRead(BaseModel):
+    room_id: str
+    note_id: int
+    expires_at: datetime
+
+
 class AgentShowcaseImportResult(BaseModel):
     """可选导入当前用户知识库的项目能力笔记。"""
 

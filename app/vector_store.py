@@ -102,6 +102,9 @@ class VectorStore:
                         "chunk_index": index,
                         "title": title,
                         "chunk": chunk,
+                        "chunk_id": f"{note_id}-{index:04d}",
+                        "title_path": _title_path(chunk, title),
+                        "chunk_char_count": len(chunk),
                     },
                 },
             )
@@ -207,6 +210,13 @@ class VectorStore:
 
 def _match(key: str, value: int) -> dict:
     return {"key": key, "match": {"value": value}}
+
+
+def _title_path(chunk: str, title: str) -> str:
+    """提取 Markdown/中文章节上下文，作为可解释引用元数据。"""
+    headings = re.findall(r"^#{1,6}\s+(.+)$|^(第[一二三四五六七八九十0-9]+[章节部分].*)$", chunk, flags=re.MULTILINE)
+    values = [a or b for a, b in headings if a or b]
+    return " / ".join(values[:3]) or title.strip()
 
 
 @lru_cache

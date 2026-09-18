@@ -78,7 +78,7 @@ class AuthService(BaseService):
         return user
 
 
-class NoteService(BaseService):
+class _NoteCreateBase(BaseService):
     """知识笔记 CRUD，并统一校验 ``owner_id`` 防止水平越权。"""
     def create(self, owner_id: int, data: schemas.NoteCreate) -> models.Note:
         note = crud.add_note(
@@ -97,6 +97,39 @@ class NoteService(BaseService):
             extra={"event": "note_created", "owner_id": owner_id, "note_id": note.id},
         )
         return note
+
+
+class NoteService(BaseService):
+    """生成并持久化每日笔记复盘，按用户/笔记/日期幂等。"""
+    def create_or_get(self, owner_id: int, note_id: int, review_date: str | None = None) -> models.NoteReview:
+        note = crud.get_note(self.db, note_id)
+        if not note or note.owner_id != owner_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="笔记不存在")
+        day = review_date or datetime.now(UTC).date().isoformat()
+        existing = crud.get_note_review(self.db, owner_id, note_id, day)
+        if existing:
+            return existing
+        prompt = (
+            "请把下面的个人知识笔记整理成严格 JSON，不要输出 Markdown。字段必须是："
+            "summary(string), key_points(string[]), questions(string[]), todo_items(string[])。"
+            "只能依据笔记内容，不要编造。每个数组最多 5 项。\n"
+            f"标题：{note.title}\n内容：{note.content}"
+        )
+        raw = "".join(agent._stream_model("你是个人知识复盘助手。", prompt))
+        try:
+            data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=502, detail="复盘结果格式错误，请稍后重试") from exc
+        review = crud.add_note_review(
+            self.db, owner_id=owner_id, note_id=note_id, review_date=day,
+            summary=str(data.get("summary", ""))[:4000],
+            key_points=[str(x) for x in data.get("key_points", [])][:5],
+            questions=[str(x) for x in data.get("questions", [])][:5],
+            todo_items=[str(x) for x in data.get("todo_items", [])][:5],
+        )
+        self._commit()
+        self.db.refresh(review)
+        return review
 
     def list(self, owner_id: int, keyword: str | None = None) -> list[models.Note]:
         return crud.list_notes(self.db, owner_id=owner_id, keyword=keyword)
@@ -175,6 +208,9 @@ class NoteService(BaseService):
             notes=[schemas.NoteRead.model_validate(note) for note in selected],
             suggested_questions=[item.suggested_question for item in SHOWCASE_NOTES],
         )
+
+
+NoteReviewService = NoteService
 
 
 class KnowledgeService(BaseService):

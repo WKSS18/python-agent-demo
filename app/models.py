@@ -43,6 +43,22 @@ class Note(Base):
     owner: Mapped["User"] = relationship(back_populates="notes")
 
 
+class NoteReview(Base):
+    """AI 生成的笔记复盘快照；同一笔记可按日期保留多次复盘。"""
+    __tablename__ = "note_reviews"
+    __table_args__ = (UniqueConstraint("owner_id", "note_id", "review_date", name="uq_note_reviews_owner_note_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    note_id: Mapped[int] = mapped_column(ForeignKey("notes.id"), index=True)
+    review_date: Mapped[str] = mapped_column(String(10), index=True)
+    summary: Mapped[str] = mapped_column(Text)
+    key_points: Mapped[list] = mapped_column(JSON, default=list)
+    questions: Mapped[list] = mapped_column(JSON, default=list)
+    todo_items: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class AgentSession(Base):
     """一次连续聊天会话；标题取首条用户问题，便于后续扩展会话列表。"""
     __tablename__ = "agent_sessions"

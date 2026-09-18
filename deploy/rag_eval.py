@@ -42,27 +42,39 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=.55)
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--dataset", type=Path, help="JSONL: {id,text} corpus lines and {query,relevant_ids,should_abstain} query lines")
     args = parser.parse_args()
     options = {"model_name": args.model, "local_files_only": bool(args.model_path)}
     if args.model_path:
         options["specific_model_path"] = args.model_path
+    corpus = CORPUS
+    queries = QUERIES
+    if args.dataset:
+        rows = [json.loads(line) for line in args.dataset.read_text(encoding="utf-8").splitlines() if line.strip()]
+        corpus = [(str(row["id"]), str(row["text"])) for row in rows if row.get("type", "corpus") == "corpus"]
+        queries = [(str(row["query"]), row.get("relevant_ids", row.get("expected"))) for row in rows if row.get("type") == "query"]
+        if not corpus or not queries:
+            raise SystemExit("dataset 至少需要 corpus 行和 query 行")
     model = TextEmbedding(**options)
-    corpus_vectors = np.asarray([v for v in model.embed([text for _, text in CORPUS])])
-    query_vectors = np.asarray([v for v in model.embed([query for query, _ in QUERIES])])
+    corpus_vectors = np.asarray([v for v in model.embed([text for _, text in corpus])])
+    query_vectors = np.asarray([v for v in model.embed([query for query, _ in queries])])
     scores = query_vectors @ corpus_vectors.T
-    relevant = [(i, expected) for i, (_, expected) in enumerate(QUERIES) if expected]
-    unrelated = [(i, expected) for i, (_, expected) in enumerate(QUERIES) if expected is None]
+    relevant = [(i, expected) for i, (_, expected) in enumerate(queries) if expected]
+    unrelated = [(i, expected) for i, (_, expected) in enumerate(queries) if not expected]
     recalls = 0
     reciprocal_ranks = []
     details = []
     for i, expected in relevant:
         ranking = np.argsort(scores[i])[::-1]
         accepted = [j for j in ranking[:args.top_k] if scores[i, j] >= args.threshold]
-        ids = [CORPUS[j][0] for j in accepted]
-        recalls += int(expected in ids)
-        rank = next((rank for rank, j in enumerate(ranking, 1) if CORPUS[j][0] == expected), 0)
+        ids = [corpus[j][0] for j in accepted]
+        expected_ids = expected if isinstance(expected, list) else [expected]
+        recalls += int(any(item in ids for item in expected_ids))
+        rank = next((rank for rank, j in enumerate(ranking, 1) if corpus[j][0] in expected_ids), 0)
         reciprocal_ranks.append(1 / rank if rank else 0)
-        details.append({"query": QUERIES[i][0], "expected": expected, "returned": ids,
+        precision = sum(item in expected_ids for item in ids) / args.top_k
+        details.append({"query": queries[i][0], "expected": expected_ids, "returned": ids,
+                        "precision_at_k": round(precision, 4),
                         "top_score": round(float(scores[i, ranking[0]]), 4)})
     false_citations = sum(
         int(float(scores[i].max()) >= args.threshold) for i, _ in unrelated
@@ -73,6 +85,7 @@ def main() -> None:
         "query_count": len(QUERIES),
         "recall_at_k": round(recalls / len(relevant), 4),
         "mrr": round(sum(reciprocal_ranks) / len(reciprocal_ranks), 4),
+        "precision_at_k": round(sum(item["precision_at_k"] for item in details) / len(details), 4),
         "false_citation_rate": round(false_citations / len(unrelated), 4),
         "details": details,
     }

@@ -54,6 +54,20 @@ def get_note(db: Session, note_id: int) -> models.Note | None:
     return db.get(models.Note, note_id)
 
 
+def get_note_review(db: Session, owner_id: int, note_id: int, review_date: str) -> models.NoteReview | None:
+    return db.scalar(select(models.NoteReview).where(
+        models.NoteReview.owner_id == owner_id,
+        models.NoteReview.note_id == note_id,
+        models.NoteReview.review_date == review_date,
+    ))
+
+
+def add_note_review(db: Session, **kwargs) -> models.NoteReview:
+    review = models.NoteReview(**kwargs)
+    db.add(review)
+    return review
+
+
 def list_owned_notes_by_ids(db: Session, owner_id: int, note_ids: list[int]) -> list[models.Note]:
     if not note_ids:
         return []

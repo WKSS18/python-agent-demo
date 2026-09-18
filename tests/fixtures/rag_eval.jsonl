@@ -1,0 +1,7 @@
+{"type":"corpus","id":"fastapi-auth","text":"FastAPI 使用依赖注入管理数据库会话，JWT 用于用户认证。"}
+{"type":"corpus","id":"qdrant-tenant","text":"Qdrant 查询必须使用 owner_id payload filter，并在回表后再次校验归属。"}
+{"type":"corpus","id":"outbox","text":"事务 Outbox 把业务数据和待处理事件写入同一个数据库事务。"}
+{"type":"query","query":"FastAPI 如何管理数据库会话？","relevant_ids":["fastapi-auth"]}
+{"type":"query","query":"向量检索如何做多租户隔离？","relevant_ids":["qdrant-tenant"]}
+{"type":"query","query":"如何避免异步任务丢失？","relevant_ids":["outbox"]}
+{"type":"query","query":"公司明年的营收是多少？","relevant_ids":[],"should_abstain":true}
