@@ -257,7 +257,17 @@ async def voice_room_signal(websocket: WebSocket, room_id: str, token: str = Que
             payload = await websocket.receive_json()
             if isinstance(payload, dict) and payload.get("type") in {"offer", "answer", "ice-candidate", "peer-ready", "hangup"}:
                 await broadcast(room, peer_id, payload)
+                if payload.get("type") == "hangup":
+                    # “结束”属于房间级操作：任意一方结束后立即关闭双方连接并销毁房间。
+                    ROOMS.pop(room_id, None)
+                    for other_id, socket in list(room.peers.items()):
+                        if other_id != peer_id:
+                            await socket.close(code=1000, reason="room-ended")
+                    await websocket.close(code=1000, reason="room-ended")
+                    return
     except WebSocketDisconnect:
+        pass
+    finally:
         room.peers.pop(peer_id, None)
         room.peer_names.pop(peer_id, None)
         if not room.peers:

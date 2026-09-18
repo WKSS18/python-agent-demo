@@ -298,7 +298,7 @@ curl https://api.example.com/knowledge/tasks/TASK_ID \
   -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
-Nginx 示例位于 `deploy/nginx.conf.example`，其中关闭了 `proxy_buffering` 并将读取超时设为 650 秒，保证 SSE 不被缓存成一次性响应。
+Nginx 示例位于 `deploy/nginx.conf.example`，其中关闭了 `proxy_buffering` 并将读取超时设为 650 秒，保证 SSE 不被缓存成一次性响应；同时传递 `Upgrade` 与 `Connection` 请求头，保证 `/api/voice-rooms/.../signal` 能从 HTTPS 正确升级为 WebSocket。若缺少这两个头，Uvicorn 会把信令请求当成普通 GET 并返回 404。
 
 推荐同源部署：Nginx 的 `/` 提供前端静态文件，`/api/` 反向代理后端。若前后端必须分域，将前端完整 Origin 写入 `CORS_ALLOWED_ORIGINS`（多个值用英文逗号分隔），并将前端 `VITE_API_BASE_URL` 指向 API 域名；不要使用 `*`。
 
@@ -577,5 +577,19 @@ WebSocket /api/voice-rooms/{room_id}/signal?token=<access_token>
 
 第一版限制为单笔记、最多两人、纯音频、内存房间和公共 STUN，不需要购买第三方服务；房间重启后失效。公网浏览器正式使用麦克风需要 HTTPS，当前 HTTP IP 地址仅适合接口验证，后续可增加域名证书、TURN 中继、录音转写和 AI 复盘。
 
+房间成员同步与麦克风授权相互独立：页面会先建立 WebSocket 并显示已经加入的用户名，再单独请求麦克风。用户拒绝授权、没有音频设备或设备被占用时不会阻止加入房间，界面会展示准确原因和“重试麦克风”按钮。任意一方点击“结束”都会广播 `hangup`、销毁服务端房间并关闭双方 WebSocket，另一端收到通知后自动退出房间。
+
 本地联调时 Vite 已开启 WebSocket 代理（`ws: true`），否则只能创建房间但信令无法建立。邀请链接标准格式为
 `/?voice_room=<room_id>`，也兼容历史的 `/voice_room=<room_id>` 格式。创建者需要保持房间页面打开，加入者使用不同账号打开链接；房间卡片会同步参与者名称和连接状态。
+
+生产排障顺序：
+
+1. HTTP 必须 301 跳转 HTTPS，证书覆盖主域名与 `www` 域名。
+2. Nginx `/api/` 必须设置 `proxy_http_version 1.1`、`Upgrade $http_upgrade` 和 `Connection "upgrade"`。
+3. 正常 WebSocket 握手在 Nginx access log 中应为 `101`；普通 GET 的 `404` 表示升级头丢失；握手前的 `403` 通常表示 token 或房间无效。
+4. 房间保存在 API 进程内存中，因此当前单机版本将 `WEB_CONCURRENCY` 设为 `1`；扩展为多 worker/多实例前，应把房间和信令状态迁移到 Redis 或独立实时服务。
+5. 麦克风失败时检查浏览器网站权限和操作系统隐私设置，再点击“重试麦克风”。
+
+### 今日复盘区域布局
+
+笔记编辑器采用固定视口布局，标题、正文、操作栏之后还会动态插入“今日复盘”和语音房间卡片。编辑器容器必须保留 `overflow-y: auto`，否则 Grid 的隐式行会被外层 `overflow: hidden` 裁掉，表现为复盘内容截断且无法滚动。复盘卡片还需设置 `overflow-wrap: anywhere`，避免长文本或链接撑破布局。

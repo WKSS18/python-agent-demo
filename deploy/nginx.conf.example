@@ -26,6 +26,10 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
+        # Preserve WebSocket upgrades for voice-room signaling.
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
         # Required for incremental SSE delivery.
         proxy_buffering off;
         proxy_cache off;
