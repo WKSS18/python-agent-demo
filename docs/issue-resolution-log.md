@@ -19,6 +19,68 @@
 
 ---
 
+## 2026-09-14：本地 `/notes` 接口 500
+
+**状态：已修复**
+
+### 1. 问题与影响
+
+本地前端进入知识对话页后，浏览器 Network 中 `GET /api/notes` 返回 `500 Internal Server Error`，导致顶部笔记数量和笔记列表无法正常加载。
+
+### 2. 复现与证据
+
+后端日志显示请求已通过鉴权并进入 `/notes` 路由，但 SQLAlchemy 查询失败：
+
+```text
+sqlite3.OperationalError: no such column: notes.source_key
+SELECT notes.id, notes.title, notes.content, notes.owner_id, notes.source_key ...
+```
+
+### 3. 根因分析
+
+代码中的 `Note` ORM 已新增内部字段 `source_key`，用于识别系统导入笔记来源并避免重复导入；但本地 SQLite 数据库仍停在 Alembic 版本 `20260811_0004`，没有执行包含该字段的迁移 `20260821_0005_add_note_source_key`。
+
+这属于“代码版本已更新，但本地数据库 Schema 未同步”的环境问题，不是前端请求、接口代理或登录 token 的问题。
+
+### 4. 方案与关键决策
+
+使用项目已有 Alembic 迁移机制升级本地数据库到最新版本，而不是临时手写 SQL 补字段。这样可以保证本地库结构与迁移历史一致，后续再切到 MySQL 或生产环境时也能用同一套流程。
+
+### 5. 修改范围
+
+本次没有改业务代码，只执行本地数据库迁移：
+
+```text
+alembic upgrade head
+```
+
+迁移结果从 `20260811_0004` 升级到 `20260821_0005 (head)`。
+
+### 6. 验证结果
+
+- `/health` 返回 `200`，服务存活正常。
+- `alembic current` 返回 `20260821_0005 (head)`。
+- 新建临时测试账号登录后请求 `/notes`，返回：
+
+```json
+{
+  "data": [],
+  "code": 200,
+  "message": "success"
+}
+```
+
+### 7. 生产发布与回滚
+
+本次只处理本地开发环境，没有同步生产，也没有操作生产数据库。
+
+### 8. 边界与后续改进
+
+- 本地启动脚本已经包含 `alembic upgrade head`，以后如果手动启动后端，也要先确认迁移已执行。
+- 可以在应用启动或就绪检查中增加当前 Alembic 版本校验，提前暴露“数据库版本落后”问题，避免用户页面上才看到 500。
+
+---
+
 ## 2026-08-22：RAG 引用无关笔记（CSS transform 问题）
 
 **状态：已上线**

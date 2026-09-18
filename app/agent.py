@@ -215,9 +215,11 @@ def _stream_model(
     user_content: str | list[dict[str, Any]],
     model: str | None = None,
 ):
-    """统一模型客户端和流式输出；无密钥时用同协议的分块 Mock 降级。"""
+    """统一真实模型客户端和流式输出；mock 仅允许本地显式开启。"""
     settings = get_settings()
     if not settings.anthropic_auth_token:
+        if not settings.allow_mock_model:
+            raise RuntimeError("模型服务未配置，生产环境禁止使用 mock 回复")
         has_image = isinstance(user_content, list)
         input_kind = "图片" if has_image else "输入文本"
         mock_answer = (

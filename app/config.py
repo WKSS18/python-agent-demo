@@ -37,8 +37,12 @@ class Settings(BaseSettings):
     anthropic_default_haiku_model: str = ""
     claude_code_subagent_model: str = ""
     api_timeout_ms: int = 600_000
+    # 仅允许本地开发时使用；生产环境必须调用真实模型，避免把演示响应带上线。
+    allow_mock_model: bool = True
     # 知识库向量检索：本地可关闭，生产环境通过 Qdrant 持久化分块向量。
     vector_store_enabled: bool = False
+    # 向量服务异常时是否允许回退到请求内的旧版检索，仅供本地调试。
+    allow_legacy_rag_fallback: bool = True
     vector_store_provider: str = "qdrant"
     qdrant_url: str = "http://127.0.0.1:6333"
     qdrant_api_key: str = ""
@@ -148,6 +152,12 @@ class Settings(BaseSettings):
             raise ValueError("生产环境必须使用 MySQL 等独立数据库，不能使用 SQLite")
         if not self.anthropic_auth_token:
             raise ValueError("生产环境必须配置 ANTHROPIC_AUTH_TOKEN")
+        if self.allow_mock_model:
+            raise ValueError("生产环境禁止 ALLOW_MOCK_MODEL")
+        if not self.vector_store_enabled:
+            raise ValueError("生产环境必须启用持久化向量库 VECTOR_STORE_ENABLED=true")
+        if self.allow_legacy_rag_fallback:
+            raise ValueError("生产环境禁止请求内旧版 RAG 降级")
         if self.vector_store_enabled and not self.qdrant_url:
             raise ValueError("启用向量检索时必须配置 QDRANT_URL")
         if self.vector_store_enabled and not self.qdrant_api_key:

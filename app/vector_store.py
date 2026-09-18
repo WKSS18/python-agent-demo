@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 import logging
+import re
 import time
 from typing import Iterable
 from uuid import NAMESPACE_URL, uuid5
@@ -21,8 +22,8 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 80
+CHUNK_SIZE = 700
+CHUNK_OVERLAP = 120
 _PREPARED_COLLECTIONS: set[tuple[str, str]] = set()
 
 
@@ -34,13 +35,43 @@ class VectorHit:
 
 
 def split_note(title: str, content: str) -> list[str]:
-    """按字符窗口切块并保留标题，让每个独立分块仍有主题上下文。"""
-    body = content.strip()
+    """按标题/段落优先、窗口兜底切块，保留 overlap 和章节上下文。
+
+    真实知识库不能只按固定字符截断：Markdown 标题、段落和列表是天然语义边界。
+    这里先按空行/标题聚合，再对超长段落做重叠窗口切分，最终每块都带文档标题。
+    """
+    body = content.replace("\r\n", "\n").strip()
     if not body:
         return [title.strip()]
-    step = CHUNK_SIZE - CHUNK_OVERLAP
-    parts = [body[start:start + CHUNK_SIZE].strip() for start in range(0, len(body), step)]
-    return [f"{title.strip()}\n{part}".strip() for part in parts if part]
+    sections = [part.strip() for part in re.split(r"\n\s*\n+", body) if part.strip()]
+    units: list[str] = []
+    current = ""
+    for section in sections:
+        # 标题开启新语义段；短段落尽量合并以减少碎片。
+        is_heading = bool(re.match(r"^(#{1,6}\s+|第[一二三四五六七八九十0-9]+[章节部分])", section))
+        if current and (is_heading or len(current) + len(section) + 2 > CHUNK_SIZE):
+            units.append(current)
+            current = ""
+        current = f"{current}\n\n{section}".strip()
+    if current:
+        units.append(current)
+
+    chunks: list[str] = []
+    previous_tail = ""
+    for unit in units:
+        if len(unit) <= CHUNK_SIZE:
+            chunk = f"{previous_tail}\n{unit}".strip() if previous_tail else unit
+            chunks.append(chunk)
+            previous_tail = unit[-CHUNK_OVERLAP:]
+            continue
+        step = CHUNK_SIZE - CHUNK_OVERLAP
+        for start in range(0, len(unit), step):
+            part = unit[start:start + CHUNK_SIZE].strip()
+            if part:
+                chunk = f"{previous_tail}\n{part}".strip() if previous_tail and start == 0 else part
+                chunks.append(chunk)
+                previous_tail = part[-CHUNK_OVERLAP:]
+    return [f"{title.strip()}\n{chunk}".strip() for chunk in chunks if chunk]
 
 
 class VectorStore:

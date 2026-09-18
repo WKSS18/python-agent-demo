@@ -635,12 +635,18 @@ class AgentService(BaseService):
                 hits = create_vector_backend().search(owner_id, question, settings.rag_candidate_limit)
             except Exception:
                 logger.exception("Vector search failed; falling back to local hybrid retrieval")
-        if not hits:
+        if not hits and settings.allow_legacy_rag_fallback:
             retrieved_notes = rag.retrieve_notes(question, all_notes, limit=settings.rag_top_k)
             hits = [
                 VectorHit(note_id=item.note.id, chunk=item.matched_chunk, score=max(0.0, item.vector_score))
                 for item in retrieved_notes
             ]
+        elif not hits and settings.vector_store_enabled:
+            # 生产环境不把内存哈希向量当作真实语义证据；向量服务暂时无结果时宁可 abstain。
+            logger.warning(
+                "rag_vector_search_empty",
+                extra={"event": "rag_vector_search_empty", "owner_id": owner_id},
+            )
         return RagPipeline().run(owner_id, question, all_notes, hits)
 
     def _build_memory_snapshot(self, session_id: int, current_question: str) -> str:

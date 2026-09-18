@@ -407,6 +407,9 @@ Chat 附件默认不会进入 Qdrant，避免临时文件未经用户确认就�
 
 ## 13. 测试与检查
 
+完整的业务流程、真实实现边界、切片策略、技术难点和面试问答见
+[docs/project-complete-interview-guide.md](docs/project-complete-interview-guide.md)。
+
 ```bash
 python -m compileall -q app
 python -m unittest discover -s tests -v
