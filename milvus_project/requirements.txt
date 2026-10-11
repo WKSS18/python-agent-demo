@@ -1,0 +1,4 @@
+pymilvus==3.0.2
+fastembed==0.7.3
+pypdf>=6,<7
+unstructured>=0.18,<0.19
